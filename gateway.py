@@ -223,11 +223,22 @@ def epay_sign(params):
 def active_model_rows():
     return db().execute('SELECT * FROM model_providers WHERE is_active=1 ORDER BY is_default DESC, sort_order ASC, id ASC').fetchall()
 
+def candidate_model_rows(requested):
+    rows=list(active_model_rows())
+    if not rows: return []
+    req=(requested or '').strip()
+    # "auto" means: try active models by priority until one works.
+    # Empty model keeps the previous behavior: start from default, then fallback by priority.
+    if not req or req.lower() in ('auto','auto:fallback','fallback'):
+        return rows
+    exact=[]; rest=[]
+    for r in rows:
+        if req in (r['model_id'], r['display_name'], r['name']): exact.append(r)
+        else: rest.append(r)
+    return exact+rest if exact else rows
+
 def select_model(requested):
-    rows=active_model_rows()
-    if requested:
-        for r in rows:
-            if requested in (r['model_id'], r['display_name'], r['name']): return r
+    rows=candidate_model_rows(requested)
     return rows[0] if rows else None
 
 def proxy_openai(provider, payload, key, input_tokens, start):
@@ -237,7 +248,7 @@ def proxy_openai(provider, payload, key, input_tokens, start):
     if provider['api_key']: headers['Authorization']='Bearer '+provider['api_key']
     out=dict(payload); out['model']=provider['model_id']
     r=requests.post(url+'/chat/completions',headers=headers,json=out,timeout=int(provider['timeout_seconds'] or 300),stream=bool(out.get('stream')))
-    if not r.ok: return jsonify({'error':{'message':r.text,'type':'upstream_error','provider':provider['name']}}),502
+    if not r.ok: raise RuntimeError(f"{provider['name']} upstream HTTP {r.status_code}: {r.text[:500]}")
     if out.get('stream'):
         def gen():
             for chunk in r.iter_content(chunk_size=None):
@@ -609,18 +620,26 @@ def chat_completions():
     if key['daily_token_limit']: limits.append(int(key['daily_token_limit']))
     if key['quota_daily']: limits.append(int(key['quota_daily']))
     if used+input_tokens>min(limits): return jsonify({'error':{'message':'Daily token quota exceeded','type':'quota_error'}}),429
-    provider=select_model(payload.get('model')); start=time.time()
-    if not provider: return jsonify({'error':{'message':'No active model provider configured','type':'model_error'}}),502
-    try:
-        if provider['provider_type']=='openai': return proxy_openai(provider,payload,key,input_tokens,start)
-        return proxy_ollama(provider,payload,key,input_tokens,start)
-    except Exception as e:
-        if os.environ.get('DEMO_FALLBACK','1')=='1':
-            content='演示模式：平台网关、用户系统、API Key 鉴权、套餐限额都已正常工作；当前模型上游不可用，所以这里返回模拟回复。收到的问题：'+(messages[-1].get('content','') if messages else '')
-            out_tokens=max(1,len(content)//2); dur=int((time.time()-start)*1000); model_id=(provider['model_id'] if provider else MODEL_NAME)+'-demo'
-            con.execute('UPDATE users SET tokens_used_today=tokens_used_today+? WHERE id=?',(input_tokens+out_tokens,key['user_id'])); con.execute('INSERT INTO usage_logs(user_id,api_key_id,tokens_input,tokens_output,model,endpoint,duration_ms,ip_address) VALUES(?,?,?,?,?,?,?,?)',(key['user_id'],key['id'],input_tokens,out_tokens,model_id,'/v1/chat/completions',dur,request.remote_addr)); con.commit()
-            return jsonify({'id':'chatcmpl-demo','object':'chat.completion','created':int(time.time()),'model':model_id,'choices':[{'index':0,'message':{'role':'assistant','content':content},'finish_reason':'stop'}],'usage':{'prompt_tokens':input_tokens,'completion_tokens':out_tokens,'total_tokens':input_tokens+out_tokens}})
-        return jsonify({'error':{'message':str(e),'type':'gateway_error'}}),502
+    candidates=candidate_model_rows(payload.get('model')); start=time.time()
+    if not candidates: return jsonify({'error':{'message':'No active model provider configured','type':'model_error'}}),502
+    # Streaming responses cannot be safely retried after bytes may have been sent to the client.
+    # For stream=true, use the first candidate only.
+    if payload.get('stream'): candidates=candidates[:1]
+    errors=[]
+    for provider in candidates:
+        try:
+            if provider['provider_type']=='openai': return proxy_openai(provider,payload,key,input_tokens,start)
+            return proxy_ollama(provider,payload,key,input_tokens,start)
+        except Exception as e:
+            errors.append({'provider':provider['name'],'model':provider['model_id'],'type':provider['provider_type'],'error':str(e)[:500]})
+            continue
+    provider=candidates[0]
+    if os.environ.get('DEMO_FALLBACK','0')=='1':
+        content='演示模式：平台网关、用户系统、API Key 鉴权、套餐限额都已正常工作；当前所有模型上游不可用，所以这里返回模拟回复。收到的问题：'+(messages[-1].get('content','') if messages else '')
+        out_tokens=max(1,len(content)//2); dur=int((time.time()-start)*1000); model_id=(provider['model_id'] if provider else MODEL_NAME)+'-demo'
+        con.execute('UPDATE users SET tokens_used_today=tokens_used_today+? WHERE id=?',(input_tokens+out_tokens,key['user_id'])); con.execute('INSERT INTO usage_logs(user_id,api_key_id,tokens_input,tokens_output,model,endpoint,duration_ms,ip_address) VALUES(?,?,?,?,?,?,?,?)',(key['user_id'],key['id'],input_tokens,out_tokens,model_id,'/v1/chat/completions',dur,request.remote_addr)); con.commit()
+        return jsonify({'id':'chatcmpl-demo','object':'chat.completion','created':int(time.time()),'model':model_id,'choices':[{'index':0,'message':{'role':'assistant','content':content},'finish_reason':'stop'}],'usage':{'prompt_tokens':input_tokens,'completion_tokens':out_tokens,'total_tokens':input_tokens+out_tokens},'fallback_errors':errors})
+    return jsonify({'error':{'message':'All model providers failed','type':'gateway_error','fallback_errors':errors}}),502
 
 init_db()
 

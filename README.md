@@ -14,6 +14,7 @@
 - SMTP 后台配置：支持 Host、端口、TLS/SSL、账号、授权码、发件邮箱、测试邮件。
 - 第三方模型中转：支持 OpenAI-compatible Base URL + API Key。
 - 自动读取模型：后台可通过供应商 `/v1/models` 自动批量导入模型 ID。
+- 自动故障切换：`model` 为空或填写 `auto` 时，按后台优先级自动尝试可用模型；指定模型失败时也会继续 fallback 到其它启用模型。
 - 本地 Ollama：支持本地 `qwen2.5-coder-14b-ms:latest` 等模型。
 - 商业化能力：套餐、余额、订单、易支付回调、发票、工单。
 - SQLite 持久化，部署简单。
