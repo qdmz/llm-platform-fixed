@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Runtime data
+*.db
+*.sqlite
+*.sqlite3
+data/
+logs/
+models/
+
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
