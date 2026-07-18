@@ -54,7 +54,7 @@ def no_cache_dynamic_pages(resp):
 
 HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>商业化 LLM 平台</title><style>
-body{margin:0;background:#f6f7fb;color:#1f2937;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC",sans-serif}.wrap{max-width:1280px;margin:0 auto;padding:28px}.hero{background:linear-gradient(135deg,#111827,#2563eb);color:white;border-radius:22px;padding:34px;box-shadow:0 16px 45px #1d4ed833}.hero h1{margin:0 0 10px;font-size:32px}.hero p{opacity:.9}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-top:18px}.card{background:white;border-radius:18px;padding:20px;box-shadow:0 8px 30px #11182714;margin-top:16px}.muted{color:#6b7280}.pill{display:inline-block;padding:4px 10px;border-radius:999px;background:#e0f2fe;color:#0369a1;font-size:12px}.ok{color:#059669}.bad{color:#dc2626}.btn{display:inline-block;border:0;border-radius:10px;background:#2563eb;color:white;padding:10px 14px;text-decoration:none;cursor:pointer}.btn2{background:#111827}.btn-danger{background:#dc2626}.input{width:100%;box-sizing:border-box;border:1px solid #d1d5db;border-radius:10px;padding:10px;margin:6px 0 10px}pre{background:#0b1020;color:#d1e7ff;border-radius:14px;padding:14px;overflow:auto}table{border-collapse:collapse}td,th{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;vertical-align:top}th{background:#f9fafb}.mini{width:120px}.price{font-size:30px;font-weight:800}.nav a{color:white;margin-right:16px}.two{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}.playground{grid-template-columns:minmax(0,1.2fr) minmax(360px,.8fr)}.chat-toolbar{display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:10px;align-items:end}.chat-prompt{min-height:120px;max-height:220px;resize:vertical;margin-top:10px}.chat-result{min-height:220px;max-height:520px}.curl-box{max-height:260px}.key-line{word-break:break-all}@media(max-width:900px){.two,.playground{grid-template-columns:1fr}.chat-toolbar{grid-template-columns:1fr}}
+body{margin:0;background:#f6f7fb;color:#1f2937;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC",sans-serif}.wrap{max-width:1280px;margin:0 auto;padding:28px}.hero{background:linear-gradient(135deg,#111827,#2563eb);color:white;border-radius:22px;padding:34px;box-shadow:0 16px 45px #1d4ed833}.hero h1{margin:0 0 10px;font-size:32px}.hero p{opacity:.9}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-top:18px}.card{background:white;border-radius:18px;padding:20px;box-shadow:0 8px 30px #11182714;margin-top:16px}.muted{color:#6b7280}.pill{display:inline-block;padding:4px 10px;border-radius:999px;background:#e0f2fe;color:#0369a1;font-size:12px}.ok{color:#059669}.bad{color:#dc2626}.btn{display:inline-block;border:0;border-radius:10px;background:#2563eb;color:white;padding:10px 14px;text-decoration:none;cursor:pointer}.btn2{background:#111827}.btn-danger{background:#dc2626}.input{width:100%;box-sizing:border-box;border:1px solid #d1d5db;border-radius:10px;padding:10px;margin:6px 0 10px}pre{background:#0b1020;color:#d1e7ff;border-radius:14px;padding:14px;overflow:auto}table{border-collapse:collapse}td,th{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;vertical-align:top}th{background:#f9fafb}.mini{width:120px}.price{font-size:30px;font-weight:800}.nav a{color:white;margin-right:16px}.two{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}.playground{grid-template-columns:minmax(0,1.2fr) minmax(360px,.8fr)}.chat-toolbar{display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:10px;align-items:end}.chat-prompt{min-height:120px;max-height:220px;resize:vertical;margin-top:10px}.chat-result{min-height:220px;max-height:520px}.result-card{background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:10px}.result-meta{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 12px}.result-meta span{background:#eef2ff;color:#3730a3;border-radius:999px;padding:4px 9px;font-size:12px}.assistant-answer{white-space:pre-wrap;line-height:1.7;font-size:15px;background:white;border:1px solid #e5e7eb;border-radius:12px;padding:14px;color:#111827}.raw-json summary{cursor:pointer;color:#2563eb;margin-top:12px}.raw-json pre{max-height:360px}.curl-box{max-height:260px}.key-line{word-break:break-all}@media(max-width:900px){.two,.playground{grid-template-columns:1fr}.chat-toolbar{grid-template-columns:1fr}}
 </style></head><body><div class="wrap"><section class="hero"><h1>企业级商业化 LLM 平台</h1><p>OpenAI 兼容 API · 用户/套餐/API Key/订单/工单/发票 · 易支付 · Ollama/第三方模型中转</p>{{nav|safe}}</section>{{body|safe}}</div></body></html>'''
 
 def h(v):
@@ -353,6 +353,41 @@ def activate():
 @app.route('/logout')
 def logout(): session.clear(); return redirect('/')
 
+def format_playground_result(provider, response_text, elapsed_ms=None):
+    provider_name=h(provider['name'] if provider else 'Ollama')
+    provider_type=h(provider['provider_type'] if provider else 'ollama')
+    configured_model=h(provider['model_id'] if provider else MODEL_NAME)
+    raw=response_text or ''
+    answer=''; actual_model=configured_model; usage=[]; finish=''
+    pretty=raw
+    try:
+        data=json.loads(raw)
+        pretty=json.dumps(data,ensure_ascii=False,indent=2)
+        if isinstance(data,dict):
+            actual_model=h(str(data.get('model') or configured_model))
+            if isinstance(data.get('choices'),list) and data['choices']:
+                ch=data['choices'][0] or {}
+                msg=ch.get('message') or {}
+                answer=msg.get('content') or ch.get('text') or ''
+                finish=ch.get('finish_reason') or ''
+            elif 'response' in data:
+                answer=data.get('response') or ''
+                finish='done' if data.get('done') else ''
+            u=data.get('usage') or {}
+            if isinstance(u,dict):
+                for label,key in [('输入','prompt_tokens'),('输出','completion_tokens'),('总计','total_tokens')]:
+                    if key in u: usage.append(f'{label} {h(str(u[key]))}')
+    except Exception:
+        answer=raw
+    if not answer:
+        answer=raw
+    meta=[f'供应商：{provider_name}', f'类型：{provider_type}', f'模型：{actual_model}']
+    if elapsed_ms is not None: meta.append(f'耗时：{int(elapsed_ms)}ms')
+    if finish: meta.append(f'结束：{h(str(finish))}')
+    meta.extend(usage)
+    meta_html=''.join(f'<span>{m}</span>' for m in meta)
+    return '<div class="result-card"><div class="result-meta">'+meta_html+'</div><div class="assistant-answer">'+h(answer)+'</div><details class="raw-json"><summary>查看原始返回 JSON / 文本</summary><pre>'+h(pretty)+'</pre></details></div>'
+
 @app.route('/playground',methods=['GET','POST'])
 @login_required
 def playground():
@@ -367,24 +402,25 @@ def playground():
             errors=[]
             for provider in candidate_model_rows(request.form.get('model')):
                 try:
+                    start_call=time.time()
                     if provider and provider['provider_type']=='openai':
                         rr=requests.post((provider['base_url'] or '').rstrip()+'/chat/completions',headers={'Authorization':'Bearer '+(provider['api_key'] or ''),'Content-Type':'application/json'},json={'model':provider['model_id'],'messages':[{'role':'user','content':prompt}],'temperature':0.4,'max_tokens':256},timeout=min(60,int(provider['timeout_seconds'] or 300)))
                         if not rr.ok: raise RuntimeError(f'HTTP {rr.status_code}: {rr.text[:300]}')
-                        result=('当前使用：%s / %s\n\n' % (provider['name'],provider['model_id']))+rr.text[:3000]; break
+                        result=format_playground_result(provider, rr.text, int((time.time()-start_call)*1000)); break
                     else:
                         model_id=(provider['model_id'] if provider else MODEL_NAME)
                         if not model_id.endswith(':latest') and ':' not in model_id: model_id=model_id+':latest'
                         rr=requests.post((provider['base_url'] if provider else OLLAMA_BASE_URL).rstrip()+'/api/generate',json={'model':model_id,'prompt':prompt,'stream':False},timeout=min(60,int(provider['timeout_seconds'] if provider else 300)))
                         if not rr.ok: raise RuntimeError(f'HTTP {rr.status_code}: {rr.text[:300]}')
-                        result=('当前使用：%s / %s\n\n' % ((provider['name'] if provider else 'Ollama'),model_id))+rr.text[:3000]; break
+                        result=format_playground_result(provider, rr.text, int((time.time()-start_call)*1000)); break
                 except Exception as e:
                     errors.append('%s/%s：%s' % (provider['name'],provider['model_id'],str(e)[:200]))
-            if not result: result='所有候选模型均调用失败：\n'+'\n'.join(errors)
-        except Exception as e: result='调用失败：'+str(e)
+            if not result: result='<div class="result-card"><div class="assistant-answer">'+h('所有候选模型均调用失败：\n'+'\n'.join(errors))+'</div></div>'
+        except Exception as e: result='<div class="result-card"><div class="assistant-answer">'+h('调用失败：'+str(e))+'</div></div>'
     models='<option value="auto">自动模式 auto · 第三方优先，本地最后兜底</option>'+''.join([f'<option value="{h(m["model_id"])}">{h(m["display_name"] or m["model_id"])} · {h(m["name"])} · {h(m["provider_type"])}</option>' for m in candidate_model_rows('auto')])
     curl="curl -X POST "+public_base_url()+"/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -H 'Authorization: Bearer YOUR_API_KEY' \\\n  -d '{\"model\":\"auto\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}'"
     return page(f'''<div class="two playground">
-<div class="card"><h2>聊天测试</h2><p class="muted">当前登录用户：{h(u["username"])} · ID {u["id"]}</p><form method="post"><div class="chat-toolbar"><div><label class="muted">选择模型</label><select class="input" name="model">{models}</select></div><button class="btn">发送测试</button></div><textarea class="input chat-prompt" name="prompt" rows="5" placeholder="输入问题，支持多行；拖动右下角可调整高度"></textarea></form><h3>输出结果</h3><pre class="chat-result">{h(result or '等待发送测试...')}</pre></div>
+<div class="card"><h2>聊天测试</h2><p class="muted">当前登录用户：{h(u["username"])} · ID {u["id"]}</p><form method="post"><div class="chat-toolbar"><div><label class="muted">选择模型</label><select class="input" name="model">{models}</select></div><button class="btn">发送测试</button></div><textarea class="input chat-prompt" name="prompt" rows="5" placeholder="输入问题，支持多行；拖动右下角可调整高度"></textarea></form><h3>输出结果</h3><div class="chat-result">{result or '<div class="result-card"><div class="assistant-answer muted">等待发送测试...</div></div>'}</div></div>
 <div class="card"><h3>使用说明</h3><p><b>推荐使用自动模式：</b><code>model: "auto"</code></p><ul><li>优先调用第三方 / OpenAI 兼容模型。</li><li>第三方模型故障、超时或返回错误时，自动尝试下一条启用模型。</li><li>所有第三方都不可用时，最后才切到本地 Ollama。</li><li>本地 14B 较慢，适合作为兜底备用。</li><li><code>stream=true</code> 暂不做自动切换，避免流式响应中途换模型。</li></ul><h3>curl 测试命令</h3><pre class="curl-box">{h(curl)}</pre><p class="muted key-line">当前 API Key：{h(raw or '请先在控制台创建；发送一次测试会自动生成或复用 Key')}</p></div>
 </div>''')
 
