@@ -1,0 +1,25 @@
+# Optional overlay: start a local Ollama sidecar together with the platform.
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.ollama.yml up -d
+#
+# Note: pulling large models still needs enough disk and time.
+
+services:
+  llm-platform:
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: llm-platform-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    # Expose only if you also want host-side ollama access
+    # ports:
+    #   - "11434:11434"
+
+volumes:
+  ollama_data:

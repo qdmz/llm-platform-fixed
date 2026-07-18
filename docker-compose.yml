@@ -1,0 +1,45 @@
+services:
+  llm-platform:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: llm-platform-fixed:latest
+    container_name: llm-platform
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-5088}:5088"
+    env_file:
+      - .env
+    environment:
+      LLM_PLATFORM_HOME: /opt/llm-platform
+      PORT: "5088"
+      # If Ollama runs on the Docker host, override in .env:
+      # OLLAMA_BASE_URL=http://host.docker.internal:11434
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://127.0.0.1:5088}
+      DOMAIN: ${DOMAIN:-localhost}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      FLASK_SECRET_KEY: ${FLASK_SECRET_KEY:-please-change-me}
+      MODEL_NAME: ${MODEL_NAME:-qwen2.5-coder-14b-ms:latest}
+      EPAY_API_URL: ${EPAY_API_URL:-}
+      EPAY_PID: ${EPAY_PID:-}
+      EPAY_KEY: ${EPAY_KEY:-}
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-300}
+    volumes:
+      # Persist SQLite DB and runtime data
+      - llm_platform_data:/opt/llm-platform/data
+      - llm_platform_logs:/opt/llm-platform/logs
+    extra_hosts:
+      # Linux Docker: resolve host machine for local Ollama
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:5088/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  llm_platform_data:
+  llm_platform_logs:

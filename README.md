@@ -26,6 +26,10 @@
 ├── gateway.py              # Flask 主程序，包含页面、API、数据库初始化和业务逻辑
 ├── requirements.txt        # Python 依赖
 ├── deploy-safe.sh          # 生产部署脚本，部署到 /opt/llm-platform
+├── Dockerfile              # Docker 生产镜像
+├── docker-compose.yml      # Docker Compose 部署
+├── docker-compose.ollama.yml # 可选 Ollama sidecar
+├── DOCKER.md               # Docker 部署说明
 ├── pull-modelscope.sh      # 本地模型拉取辅助脚本
 ├── .env.example            # 环境变量示例，禁止提交真实 .env
 ├── DEPLOY.md               # 部署说明
@@ -51,6 +55,17 @@ python gateway.py
 
 - 用户名：`admin`
 - 密码：由 `ADMIN_PASSWORD` 指定
+
+## Docker 快速运行
+
+```bash
+cp .env.docker.example .env
+# 编辑 DOMAIN / PUBLIC_BASE_URL / ADMIN_PASSWORD / FLASK_SECRET_KEY
+docker compose up -d --build
+curl http://127.0.0.1:5088/health
+```
+
+更多说明见 [DOCKER.md](./DOCKER.md)。
 
 ## 生产部署
 

@@ -286,3 +286,22 @@ cp /opt/llm-platform/data/platform.db /opt/llm-platform/data/platform.db.$(date 
 ```
 
 建议后台将稳定的第三方模型设为默认；本地 Ollama 无论排序如何都会作为最后兜底，避免慢速本地模型抢先响应。
+
+
+## Docker 部署
+
+项目已提供 Docker 版本：
+
+```bash
+cp .env.docker.example .env
+docker compose up -d --build
+curl http://127.0.0.1:5088/health
+```
+
+如需 Docker 同时启动 Ollama：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.ollama.yml up -d --build
+```
+
+完整说明见 [DOCKER.md](./DOCKER.md)。

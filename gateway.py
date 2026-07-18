@@ -21,7 +21,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 BASE_DIR = os.environ.get('LLM_PLATFORM_HOME', '/opt/llm-platform')
 DATA_DIR = os.path.join(BASE_DIR, 'data')
 DB_PATH = os.path.join(DATA_DIR, 'platform.db')
-MODEL_NAME = os.environ.get('MODEL_NAME', 'qwen-coder-14b-cpu')
+MODEL_NAME = os.environ.get('MODEL_NAME', 'qwen2.5-coder-14b-ms:latest')
 OLLAMA_BASE_URL = os.environ.get('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
