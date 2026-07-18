@@ -226,9 +226,14 @@ def active_model_rows():
 def candidate_model_rows(requested):
     rows=list(active_model_rows())
     if not rows: return []
+    def prefer_remote(row):
+        # Auto mode policy: third-party/OpenAI-compatible providers first, local Ollama last.
+        # Keep admin priority inside each group.
+        return 1 if row['provider_type']=='ollama' else 0
+    rows=sorted(rows, key=lambda r: (prefer_remote(r), 0 if r['is_default'] else 1, int(r['sort_order'] or 100), int(r['id'])))
     req=(requested or '').strip()
-    # "auto" means: try active models by priority until one works.
-    # Empty model keeps the previous behavior: start from default, then fallback by priority.
+    # "auto" means: try third-party models by priority, then local Ollama as final fallback.
+    # Empty model behaves the same as auto.
     if not req or req.lower() in ('auto','auto:fallback','fallback'):
         return rows
     exact=[]; rest=[]

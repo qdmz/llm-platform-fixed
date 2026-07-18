@@ -268,9 +268,9 @@ cp /opt/llm-platform/data/platform.db /opt/llm-platform/data/platform.db.$(date 
 
 行为规则：
 
-- `model` 为空或 `auto`：按后台启用模型优先级依次尝试。
+- `model` 为空或 `auto`：按“第三方优先、本地 Ollama 最后兜底”的顺序依次尝试。
 - 指定具体模型：先尝试指定模型，失败后继续尝试其它启用模型。
-- 后台优先级：`is_default DESC, sort_order ASC, id ASC`。
+- 自动模式优先级：第三方/OpenAI 兼容供应商优先，本地 Ollama 最后兜底；每组内部按 `is_default DESC, sort_order ASC, id ASC`。
 - 故障切换触发条件：连接错误、请求超时、上游非 2xx、Ollama `not found`、JSON/网关异常等。
 - `stream=true` 不做多模型重试，因为流式响应一旦开始发送，就无法安全切换到另一个模型。
 - 所有模型都失败时返回：
@@ -285,4 +285,4 @@ cp /opt/llm-platform/data/platform.db /opt/llm-platform/data/platform.db.$(date 
 }
 ```
 
-建议后台将稳定的第三方模型设为默认，将本地 14B 或低速模型排序靠后，作为兜底备用。
+建议后台将稳定的第三方模型设为默认；本地 Ollama 无论排序如何都会作为最后兜底，避免慢速本地模型抢先响应。
