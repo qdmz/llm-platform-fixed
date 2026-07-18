@@ -364,21 +364,28 @@ def playground():
             raw='sk-'+secrets.token_urlsafe(32); con.execute('INSERT INTO api_keys(user_id,key_hash,key_prefix,name,rate_limit) VALUES(?,?,?,?,?)',(u['id'],hashlib.sha256(raw.encode()).hexdigest(),raw[:10],'playground',get_plan_config(True).get(u['plan'],PLAN_CONFIG['free'])['rate_limit'])); con.commit()
         else: raw=k['key_prefix']+'...（已有 Key，完整值只在创建时显示）'
         try:
-            provider=select_model(request.form.get('model'))
-            if provider and provider['provider_type']=='openai':
-                rr=requests.post((provider['base_url'] or '').rstrip()+'/chat/completions',headers={'Authorization':'Bearer '+(provider['api_key'] or ''),'Content-Type':'application/json'},json={'model':provider['model_id'],'messages':[{'role':'user','content':prompt}],'temperature':0.4,'max_tokens':256},timeout=60)
-                result=rr.text[:3000]
-            else:
-                model_id=(provider['model_id'] if provider else MODEL_NAME)
-                if not model_id.endswith(':latest') and ':' not in model_id: model_id=model_id+':latest'
-                rr=requests.post((provider['base_url'] if provider else OLLAMA_BASE_URL).rstrip()+'/api/generate',json={'model':model_id,'prompt':prompt,'stream':False},timeout=int(provider['timeout_seconds'] if provider else 300))
-                result=rr.text[:3000]
+            errors=[]
+            for provider in candidate_model_rows(request.form.get('model')):
+                try:
+                    if provider and provider['provider_type']=='openai':
+                        rr=requests.post((provider['base_url'] or '').rstrip()+'/chat/completions',headers={'Authorization':'Bearer '+(provider['api_key'] or ''),'Content-Type':'application/json'},json={'model':provider['model_id'],'messages':[{'role':'user','content':prompt}],'temperature':0.4,'max_tokens':256},timeout=min(60,int(provider['timeout_seconds'] or 300)))
+                        if not rr.ok: raise RuntimeError(f'HTTP {rr.status_code}: {rr.text[:300]}')
+                        result=('当前使用：%s / %s\n\n' % (provider['name'],provider['model_id']))+rr.text[:3000]; break
+                    else:
+                        model_id=(provider['model_id'] if provider else MODEL_NAME)
+                        if not model_id.endswith(':latest') and ':' not in model_id: model_id=model_id+':latest'
+                        rr=requests.post((provider['base_url'] if provider else OLLAMA_BASE_URL).rstrip()+'/api/generate',json={'model':model_id,'prompt':prompt,'stream':False},timeout=min(60,int(provider['timeout_seconds'] if provider else 300)))
+                        if not rr.ok: raise RuntimeError(f'HTTP {rr.status_code}: {rr.text[:300]}')
+                        result=('当前使用：%s / %s\n\n' % ((provider['name'] if provider else 'Ollama'),model_id))+rr.text[:3000]; break
+                except Exception as e:
+                    errors.append('%s/%s：%s' % (provider['name'],provider['model_id'],str(e)[:200]))
+            if not result: result='所有候选模型均调用失败：\n'+'\n'.join(errors)
         except Exception as e: result='调用失败：'+str(e)
-    models=''.join([f'<option value="{h(m["model_id"])}">{h(m["display_name"] or m["model_id"])} · {h(m["name"])}</option>' for m in active_model_rows()])
-    curl="curl -X POST "+public_base_url()+"/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -H 'Authorization: Bearer YOUR_API_KEY' \\\n  -d '{\"model\":\""+(active_model_rows()[0]['model_id'] if active_model_rows() else MODEL_NAME)+"\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}'"
+    models='<option value="auto">自动模式 auto · 第三方优先，本地最后兜底</option>'+''.join([f'<option value="{h(m["model_id"])}">{h(m["display_name"] or m["model_id"])} · {h(m["name"])} · {h(m["provider_type"])}</option>' for m in candidate_model_rows('auto')])
+    curl="curl -X POST "+public_base_url()+"/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -H 'Authorization: Bearer YOUR_API_KEY' \\\n  -d '{\"model\":\"auto\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}'"
     return page(f'''<div class="two playground">
 <div class="card"><h2>聊天测试</h2><p class="muted">当前登录用户：{h(u["username"])} · ID {u["id"]}</p><form method="post"><div class="chat-toolbar"><div><label class="muted">选择模型</label><select class="input" name="model">{models}</select></div><button class="btn">发送测试</button></div><textarea class="input chat-prompt" name="prompt" rows="5" placeholder="输入问题，支持多行；拖动右下角可调整高度"></textarea></form><h3>输出结果</h3><pre class="chat-result">{h(result or '等待发送测试...')}</pre></div>
-<div class="card"><h3>curl 测试命令</h3><pre class="curl-box">{h(curl)}</pre><p class="muted key-line">当前 API Key：{h(raw or '请先在控制台创建；发送一次测试会自动生成或复用 Key')}</p></div>
+<div class="card"><h3>使用说明</h3><p><b>推荐使用自动模式：</b><code>model: "auto"</code></p><ul><li>优先调用第三方 / OpenAI 兼容模型。</li><li>第三方模型故障、超时或返回错误时，自动尝试下一条启用模型。</li><li>所有第三方都不可用时，最后才切到本地 Ollama。</li><li>本地 14B 较慢，适合作为兜底备用。</li><li><code>stream=true</code> 暂不做自动切换，避免流式响应中途换模型。</li></ul><h3>curl 测试命令</h3><pre class="curl-box">{h(curl)}</pre><p class="muted key-line">当前 API Key：{h(raw or '请先在控制台创建；发送一次测试会自动生成或复用 Key')}</p></div>
 </div>''')
 
 @app.route('/dashboard',methods=['GET','POST'])
