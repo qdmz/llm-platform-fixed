@@ -361,6 +361,22 @@ curl https://newapi.example.com/v1/messages \
 ```
 
 
+
+
+### 后台说明与模型能力识别
+
+部署后进入管理后台，可以在“后台使用说明 / OpenAI 兼容接口”区域查看：
+
+- OpenAI 兼容 Base URL
+- `/v1/models`
+- `/v1/chat/completions`
+- `/v1/responses`
+- `/v1/messages`
+- 文本和图片请求 curl 示例
+
+在“模型配置管理”区域可以点击“一键重新识别全部模型多模态能力”。该操作不会发起对话请求、不消耗模型额度，只根据 `/v1/models` 元数据和模型名规则推断图片/视频/音频能力。识别后建议人工抽查重点模型，尤其是第三方聚合商自定义命名的模型。
+
+
 ## Docker 部署
 
 项目已提供 Docker 版本：

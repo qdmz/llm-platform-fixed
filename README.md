@@ -135,3 +135,15 @@ curl https://newapi.example.com/v1/chat/completions \
 后台模型配置可为每个上游设置协议类型（OpenAI Chat / OpenAI Responses / Anthropic Messages）、模态能力（文本、图片、视频、音频）、stream/tools 支持以及 token 上限。网关会在调用前按能力过滤模型，并在不同协议之间做基础请求/响应转换。
 
 详细部署和配置见 [DEPLOY.md](./DEPLOY.md)。
+
+
+### 后台使用说明与模型能力识别
+
+管理后台已内置“后台使用说明 / OpenAI 兼容接口”卡片，说明 Base URL、API Key、`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages` 以及多模态调用示例。
+
+模型配置支持一键重新识别全部模型多模态能力：
+
+- 优先使用 `/v1/models` 返回的模型元数据（如果上游提供）
+- 再按常见模型命名规则识别：`vision`、`vl`、`vlm`、`image`、`video`、`audio`、`omni`、`fuyu`、`kosmos`、`neva`、`vila`、`gemini` 等
+- 识别结果会写入 `modalities` / `supports_vision` / `supports_video`
+- 为避免误路由，`tools` 不按名称批量自动开启，建议按上游真实能力手动勾选
