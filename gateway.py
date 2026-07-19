@@ -1060,7 +1060,10 @@ def health():
 def models():
     data=[]
     for m in active_model_rows(): data.append({'id':m['display_name'] or m['model_id'],'object':'model','created':int(time.time()),'owned_by':m['name'],'provider_type':m['provider_type'],'endpoint_type':get_provider_endpoint_type(m),'capabilities':{'modalities':sorted(get_provider_modalities(m)),'stream':bool(m['supports_stream']),'tools':bool(m['supports_tools']),'max_input_tokens':m['max_input_tokens'],'max_output_tokens':m['max_output_tokens']}})
-    return jsonify({'object':'list','data':data})
+    resp=jsonify({'object':'list','data':data})
+    resp.headers['Cache-Control']='no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma']='no-cache'
+    return resp
 
 def run_gateway_request(payload, target_api='chat_completions'):
     key,_=api_auth()
