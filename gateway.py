@@ -1077,8 +1077,13 @@ def run_gateway_request(payload, target_api='chat_completions'):
     raw_candidates=candidate_model_rows(requested)
     if not raw_candidates: return jsonify({'error':{'message':'No active model provider configured','type':'model_error','code':'unsupported_model'}}),502
     endpoint_types=None
-    if target_api=='messages': endpoint_types={'anthropic_messages'}
-    candidates=filter_candidates_by_capability(raw_candidates,payload,endpoint_types)
+    if target_api=='messages':
+        # Try anthropic_messages models first, fall back to chat_completions for auto/any model
+        candidates=filter_candidates_by_capability(raw_candidates,payload,{'anthropic_messages'})
+        if not candidates:
+            candidates=filter_candidates_by_capability(raw_candidates,payload,{'chat_completions'})
+    else:
+        candidates=filter_candidates_by_capability(raw_candidates,payload,endpoint_types)
     if not candidates:
         return jsonify({'error':{'message':'No provider matches requested model/protocol/capabilities','type':'capability_error','code':'unsupported_modality','required_modalities':sorted(detect_modalities_from_payload(payload))}}),400
     # Streaming responses cannot be safely retried after bytes may have been sent to the client.
