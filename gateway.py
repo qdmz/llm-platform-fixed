@@ -173,7 +173,61 @@ def public_base_url():
     st=get_settings()
     return (st.get('public_base_url') or f"https://{st.get('domain') or DOMAIN}").rstrip('/')
 
-def fetch_openai_models(base_url, api_key='', timeout=20):
+def infer_model_capabilities(model_id, provider_name='', meta=None):
+    """Best-effort capability inference from /models metadata and common model naming.
+    It is intentionally conservative for text-only models and marks likely vision/video/audio models
+    so the router can pre-filter multimodal requests before calling upstream.
+    """
+    text=((provider_name or '')+' '+(model_id or '')).lower()
+    meta=meta or {}
+    modalities={'text'}
+    supports_tools=0
+    supports_stream=1
+    ctx=None; out=None
+    # Common metadata fields from OpenAI-compatible aggregators.
+    for key in ('modalities','input_modalities','supported_modalities'):
+        vals=meta.get(key) if isinstance(meta,dict) else None
+        if isinstance(vals,list):
+            for v in vals:
+                v=str(v).lower()
+                if v in ('text','image','video','audio'): modalities.add(v)
+                if v in ('vision','vl'): modalities.add('image')
+    caps=meta.get('capabilities') if isinstance(meta,dict) else None
+    if isinstance(caps,dict):
+        for k,v in caps.items():
+            kl=str(k).lower()
+            if v and kl in ('vision','image','images'): modalities.add('image')
+            if v and kl in ('video','videos'): modalities.add('video')
+            if v and kl in ('audio','speech'): modalities.add('audio')
+            if v and kl in ('tools','tool_calling','function_calling'): supports_tools=1
+            if kl=='stream' and v is False: supports_stream=0
+        if isinstance(caps.get('modalities'),list):
+            for v in caps.get('modalities'):
+                v=str(v).lower()
+                if v in ('text','image','video','audio'): modalities.add(v)
+    for key in ('context_length','max_context_length','max_input_tokens'):
+        try:
+            if meta.get(key): ctx=int(meta.get(key)); break
+        except Exception: pass
+    for key in ('max_output_tokens','max_completion_tokens'):
+        try:
+            if meta.get(key): out=int(meta.get(key)); break
+        except Exception: pass
+    # Heuristics for popular model naming.
+    image_words=['vision','vl','vlm','visual','image','img','fuyu','kosmos','neva','vila','deplot','nvclip','qwen-vl','llava','pixtral','gpt-4o','gemini','claude-3','claude-3.5','claude-3-5','claude-3.7','claude-4','omni']
+    video_words=['video','cosmos','sora','veo','wan','kling','hunyuan-video','ai-synthetic-video']
+    audio_words=['audio','speech','tts','asr','whisper','realtime','omni']
+    if any(w in text for w in image_words): modalities.add('image')
+    if any(w in text for w in video_words): modalities.add('video')
+    if any(w in text for w in audio_words): modalities.add('audio')
+    # Embedding/rerank/safety parser models are usually not chat multimodal even if vendor name contains clues.
+    non_chat=['embed','embedding','rerank','bge-','gliner','guard','safety','reward','parse','detector','translate']
+    if any(w in text for w in non_chat):
+        supports_tools=0
+        if not any(w in text for w in ['vl','vision','image','video','audio','omni']): modalities={'text'}
+    return {'modalities':sorted(modalities),'supports_stream':supports_stream,'supports_tools':supports_tools,'max_input_tokens':ctx,'max_output_tokens':out}
+
+def fetch_openai_model_specs(base_url, api_key='', timeout=20):
     base=(base_url or '').rstrip('/')
     if not base: raise RuntimeError('Base URL 为空')
     headers={'Accept':'application/json'}
@@ -181,12 +235,19 @@ def fetch_openai_models(base_url, api_key='', timeout=20):
     r=requests.get(base+'/models',headers=headers,timeout=timeout)
     if not r.ok: raise RuntimeError(f'读取模型失败 HTTP {r.status_code}: {r.text[:500]}')
     obj=r.json(); data=obj.get('data') if isinstance(obj,dict) else obj
-    models=[]
+    specs=[]
     if isinstance(data,list):
         for item in data:
-            mid=item.get('id') if isinstance(item,dict) else str(item)
-            if mid: models.append(str(mid))
-    return sorted(set(models))
+            if isinstance(item,dict):
+                mid=item.get('id')
+                if mid: specs.append({'id':str(mid),'meta':item})
+            else:
+                specs.append({'id':str(item),'meta':{}})
+    dedup={x['id']:x for x in specs if x.get('id')}
+    return [dedup[k] for k in sorted(dedup)]
+
+def fetch_openai_models(base_url, api_key='', timeout=20):
+    return [x['id'] for x in fetch_openai_model_specs(base_url, api_key, timeout)]
 
 def send_mail(to_email, subject, html_body):
     st=get_settings()
@@ -300,6 +361,39 @@ def get_provider_extra(provider):
         return extra if isinstance(extra, dict) else {}
     except Exception:
         return {}
+
+def openai_compat_docs_html(public_base=None):
+    base=h(public_base or public_base_url())
+    return f"""<div class="card"><h3>后台使用说明 / OpenAI 兼容接口</h3>
+<p class="muted">平台对外保持 OpenAI 兼容，用户只需要使用本站 API Key 和 Base URL。后台模型配置负责把不同第三方协议统一中转。</p>
+<div class="grid"><div><h4>对外接口</h4><ul>
+<li><code>GET /v1/models</code>：模型列表，含 <code>endpoint_type</code> 和 <code>capabilities</code></li>
+<li><code>POST /v1/chat/completions</code>：OpenAI Chat Completions 兼容</li>
+<li><code>POST /v1/responses</code>：OpenAI Responses 兼容</li>
+<li><code>POST /v1/messages</code>：Anthropic Messages 兼容入口</li>
+</ul></div><div><h4>模型配置字段</h4><ul>
+<li><b>协议类型</b>：OpenAI Chat / OpenAI Responses / Anthropic Messages</li>
+<li><b>模态能力</b>：文本、图片、视频、音频</li>
+<li><b>stream/tools</b>：按上游真实能力勾选</li>
+<li><b>extra_config</b>：JSON 扩展，例如 <code>{{"anthropic_version":"2023-06-01"}}</code></li>
+</ul></div></div>
+<h4>curl 示例</h4><pre class="curl-box">curl {base}/v1/models
+
+curl {base}/v1/chat/completions \\
+  -H 'Authorization: Bearer sk-你的Key' \\
+  -H 'Content-Type: application/json' \\
+  -d '{{"model":"auto","messages":[{{"role":"user","content":"Say OK"}}]}}'
+
+curl {base}/v1/responses \\
+  -H 'Authorization: Bearer sk-你的Key' \\
+  -H 'Content-Type: application/json' \\
+  -d '{{"model":"auto","input":"Say OK"}}'
+
+curl {base}/v1/chat/completions \\
+  -H 'Authorization: Bearer sk-你的Key' \\
+  -H 'Content-Type: application/json' \\
+  -d '{{"model":"auto","messages":[{{"role":"user","content":[{{"type":"text","text":"描述图片"}},{{"type":"image_url","image_url":{{"url":"https://example.com/a.jpg"}}}}]}}]}}'</pre>
+<p class="muted">建议普通用户使用 <code>model:"auto"</code>，网关会按模型能力、排序和可用性自动选择；<code>stream=true</code> 不做中途失败切换。</p></div>"""
 
 def detect_modalities_from_payload(payload):
     mods={'text'}
@@ -716,7 +810,7 @@ def playground():
     curl="curl -X POST "+public_base_url()+"/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -H 'Authorization: Bearer YOUR_API_KEY' \\\n  -d '{\"model\":\"auto\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}'"
     return page(f'''<div class="two playground">
 <div class="card"><h2>聊天测试</h2><p class="muted">当前登录用户：{h(u["username"])} · ID {u["id"]}</p><form method="post"><div class="chat-toolbar"><div><label class="muted">选择模型</label><select class="input" name="model">{models}</select></div><button class="btn">发送测试</button></div><textarea class="input chat-prompt" name="prompt" rows="5" placeholder="输入问题，支持多行；拖动右下角可调整高度"></textarea></form><h3>输出结果</h3><div class="chat-result">{result or '<div class="result-card"><div class="assistant-answer muted">等待发送测试...</div></div>'}</div></div>
-<div class="card"><h3>使用说明</h3><p><b>推荐使用自动模式：</b><code>model: "auto"</code></p><ul><li>优先调用第三方 / OpenAI 兼容模型。</li><li>第三方模型故障、超时或返回错误时，自动尝试下一条启用模型。</li><li>所有第三方都不可用时，最后才切到本地 Ollama。</li><li>本地 14B 较慢，适合作为兜底备用。</li><li><code>stream=true</code> 暂不做自动切换，避免流式响应中途换模型。</li></ul><h3>curl 测试命令</h3><pre class="curl-box">{h(curl)}</pre><p class="muted key-line">当前 API Key：{h(raw or '请先在控制台创建；发送一次测试会自动生成或复用 Key')}</p></div>
+<div class="card"><h3>使用说明</h3><p><b>推荐使用自动模式：</b><code>model: "auto"</code></p><ul><li>优先调用第三方 / OpenAI 兼容模型。</li><li>第三方模型故障、超时或返回错误时，自动尝试下一条启用模型。</li><li>请求包含图片/视频/音频/tools 时，会先按后台能力配置筛选模型。</li><li>所有第三方都不可用时，最后才切到本地 Ollama。</li><li><code>stream=true</code> 暂不做自动切换，避免流式响应中途换模型。</li></ul><h3>OpenAI 兼容接口</h3><ul><li><code>/v1/models</code></li><li><code>/v1/chat/completions</code></li><li><code>/v1/responses</code></li><li><code>/v1/messages</code></li></ul><h3>curl 测试命令</h3><pre class="curl-box">{h(curl)}</pre><p class="muted key-line">当前 API Key：{h(raw or '请先在控制台创建；发送一次测试会自动生成或复用 Key')}</p></div>
 </div>''')
 
 @app.route('/dashboard',methods=['GET','POST'])
@@ -894,12 +988,22 @@ def admin():
         elif act=='discover_models':
             name=request.form.get('name','第三方模型').strip() or '第三方模型'; base_url=request.form.get('base_url','').rstrip('/'); api_key=request.form.get('api_key',''); timeout=int(request.form.get('timeout_seconds') or 20); sort_order=int(request.form.get('sort_order') or 100)
             try:
-                mids=fetch_openai_models(base_url,api_key,timeout); added=0
-                for mid in mids:
+                specs=fetch_openai_model_specs(base_url,api_key,timeout); added=0
+                for spec in specs:
+                    mid=spec['id']; caps=infer_model_capabilities(mid,name,spec.get('meta') or {})
                     if not con.execute('SELECT 1 FROM model_providers WHERE provider_type=? AND base_url=? AND model_id=?',('openai',base_url,mid)).fetchone():
-                        con.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds,endpoint_type,modalities,supports_stream,supports_tools) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(name,'openai',base_url,api_key,mid,mid,0,1,sort_order,300,'chat_completions','["text"]',1,0)); added+=1
-                con.commit(); msg=f'已读取到 {len(mids)} 个模型，新增 {added} 个；已存在的自动跳过'
+                        con.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds,endpoint_type,modalities,supports_stream,supports_tools,max_input_tokens,max_output_tokens) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(name,'openai',base_url,api_key,mid,mid,0,1,sort_order,300,'chat_completions',json.dumps(caps['modalities'],ensure_ascii=False),caps['supports_stream'],caps['supports_tools'],caps.get('max_input_tokens'),caps.get('max_output_tokens'))); added+=1
+                con.commit(); msg=f'已读取到 {len(specs)} 个模型，新增 {added} 个；已存在的自动跳过；已按名称/元数据自动识别多模态能力'
             except Exception as e: msg='读取模型失败：'+str(e)
+        elif act=='detect_model_caps':
+            rows=con.execute('SELECT * FROM model_providers').fetchall(); changed=0; multi=0
+            for row in rows:
+                caps=infer_model_capabilities(row['model_id'], row['name'], {})
+                mods=json.dumps(caps['modalities'],ensure_ascii=False)
+                con.execute('UPDATE model_providers SET modalities=?,supports_stream=?,max_input_tokens=COALESCE(max_input_tokens,?),max_output_tokens=COALESCE(max_output_tokens,?),supports_vision=?,supports_video=? WHERE id=?',(mods,caps['supports_stream'],caps.get('max_input_tokens'),caps.get('max_output_tokens'),1 if 'image' in caps['modalities'] else 0,1 if 'video' in caps['modalities'] else 0,row['id']))
+                changed+=1
+                if len(caps['modalities'])>1: multi+=1
+            con.commit(); msg=f'已重新识别 {changed} 个模型能力，其中疑似多模态 {multi} 个'
         elif act=='delete_model': con.execute('DELETE FROM model_providers WHERE id=?',(request.form.get('model_row_id'),)); con.commit(); msg='模型配置已删除'
     st=get_settings(); pay_missing=[]
     if st.get('payment_enabled')!='1': pay_missing.append('未启用')
@@ -928,12 +1032,12 @@ def admin():
         return ''.join([f'<option value="{v}" {sel(cur,v)}>{label}</option>' for v,label in [('chat_completions','OpenAI Chat'),('responses','OpenAI Responses'),('anthropic_messages','Anthropic Messages')]])
     model_html=''.join([f'''<tr><td>{m["id"]}<form method="post"><input type="hidden" name="act" value="save_model"><input type="hidden" name="model_row_id" value="{m["id"]}"></td><td><input class="input mini" name="name" value="{h(m["name"])}"><br><select class="input mini" name="endpoint_type">{endpoint_opts(get_provider_endpoint_type(m))}</select></td><td><select class="input mini" name="provider_type"><option value="openai" {sel(m["provider_type"],"openai")}>HTTP API</option><option value="ollama" {sel(m["provider_type"],"ollama")}>Ollama</option></select></td><td><input class="input" name="base_url" value="{h(m["base_url"])}" placeholder="https://api.xxx/v1"><br><input class="input" name="extra_config" value="{h(m["extra_config"] or '{}')}" placeholder='{{"anthropic_version":"2023-06-01"}}'></td><td><input class="input" name="api_key" value="{h(m["api_key"])}"></td><td><input class="input mini" name="model_id" value="{h(m["model_id"])}"><br><input class="input mini" name="display_name" value="{h(m["display_name"] or "")}"></td><td>{yn("is_default",m["is_default"])}{yn("is_active",m["is_active"])}</td><td><label><input type="checkbox" name="mod_text" value="1" {mod_checked(m,'text')}>文</label><label><input type="checkbox" name="mod_image" value="1" {mod_checked(m,'image')}>图</label><label><input type="checkbox" name="mod_video" value="1" {mod_checked(m,'video')}>视频</label><label><input type="checkbox" name="mod_audio" value="1" {mod_checked(m,'audio')}>音频</label><br>{yn("supports_stream",m["supports_stream"])}<span class="muted">stream</span>{yn("supports_tools",m["supports_tools"])}<span class="muted">tools</span></td><td><input class="input mini" name="sort_order" value="{h(m["sort_order"])}"><input class="input mini" name="timeout_seconds" value="{h(m["timeout_seconds"])}"><input class="input mini" name="max_input_tokens" value="{h(m["max_input_tokens"] or "")}" placeholder="输入token"><input class="input mini" name="max_output_tokens" value="{h(m["max_output_tokens"] or "")}" placeholder="输出token"></td><td><button class="btn">保存</button></form><form method="post"><input type="hidden" name="act" value="delete_model"><input type="hidden" name="model_row_id" value="{m["id"]}"><button class="btn btn-danger">删除</button></form></td></tr>''' for m in model_rows])
     new_model='''<tr><td>新建<form method="post"><input type="hidden" name="act" value="save_model"></td><td><input class="input mini" name="name" placeholder="供应商名"><br><select class="input mini" name="endpoint_type"><option value="chat_completions">OpenAI Chat</option><option value="responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option></select></td><td><select class="input mini" name="provider_type"><option value="openai">HTTP API</option><option value="ollama">Ollama</option></select></td><td><input class="input" name="base_url" placeholder="https://api.xxx/v1"><br><input class="input" name="extra_config" value="{}"></td><td><input class="input" name="api_key"></td><td><input class="input mini" name="model_id" placeholder="gpt-4o-mini"><br><input class="input mini" name="display_name"></td><td><select name="is_default" class="input mini"><option value="0">默认否</option><option value="1">默认是</option></select><select name="is_active" class="input mini"><option value="1">启用</option><option value="0">禁用</option></select></td><td><label><input type="checkbox" name="mod_text" value="1" checked>文</label><label><input type="checkbox" name="mod_image" value="1">图</label><label><input type="checkbox" name="mod_video" value="1">视频</label><label><input type="checkbox" name="mod_audio" value="1">音频</label><br><select name="supports_stream" class="input mini"><option value="1">stream开</option><option value="0">stream关</option></select><select name="supports_tools" class="input mini"><option value="0">tools关</option><option value="1">tools开</option></select></td><td><input class="input mini" name="sort_order" value="100"><input class="input mini" name="timeout_seconds" value="300"><input class="input mini" name="max_input_tokens" placeholder="输入token"><input class="input mini" name="max_output_tokens" placeholder="输出token"></td><td><button class="btn">新增</button></form></td></tr>'''
-    discover_form='''<form method="post"><input type="hidden" name="act" value="discover_models"><div class="grid"><div><label>供应商名称</label><input class="input" name="name" placeholder="例如：硅基流动/自建 NewAPI"></div><div><label>Base URL</label><input class="input" name="base_url" placeholder="https://api.xxx/v1"></div><div><label>API Key</label><input class="input" name="api_key" placeholder="sk-..."></div><div><label>排序</label><input class="input" name="sort_order" value="100"></div><div><label>读取超时秒</label><input class="input" name="timeout_seconds" value="20"></div></div><button class="btn btn2">通过 /v1/models 自动读取并批量导入</button></form>'''
+    discover_form='''<form method="post"><input type="hidden" name="act" value="discover_models"><div class="grid"><div><label>供应商名称</label><input class="input" name="name" placeholder="例如：硅基流动/自建 NewAPI"></div><div><label>Base URL</label><input class="input" name="base_url" placeholder="https://api.xxx/v1"></div><div><label>API Key</label><input class="input" name="api_key" placeholder="sk-..."></div><div><label>排序</label><input class="input" name="sort_order" value="100"></div><div><label>读取超时秒</label><input class="input" name="timeout_seconds" value="20"></div></div><button class="btn btn2">通过 /v1/models 自动读取并批量导入</button></form><form method="post" style="margin-top:8px"><input type="hidden" name="act" value="detect_model_caps"><button class="btn btn2">一键重新识别全部模型多模态能力</button><span class="muted">按上游元数据和模型名规则识别，不消耗对话额度。</span></form>'''
     usage_html=''.join([f'<tr><td>{h(u["username"])}</td><td>{u["calls"]}</td><td>{u["total_tokens"]}</td><td>{h(u["last_at"])}</td></tr>' for u in usage]) or '<tr><td colspan="4">暂无调用日志</td></tr>'
     body=f'''<div class="card"><h2>管理后台</h2>{'<p class="ok">'+h(msg)+'</p>' if msg else ''}
 <h3>易支付配置</h3><p>当前支付状态：{pay_status}</p><form method="post"><input type="hidden" name="act" value="save_epay"><div class="grid"><div><label>启用支付</label><select class="input" name="payment_enabled"><option value="0" {sel(st.get('payment_enabled'),'0')}>禁用/演示</option><option value="1" {sel(st.get('payment_enabled'),'1')}>启用</option></select></div><div><label>易支付网关</label><input class="input" name="epay_api_url" value="{h(st.get('epay_api_url',''))}" placeholder="https://epay.example.com"></div><div><label>商户 PID</label><input class="input" name="epay_pid" value="{h(st.get('epay_pid',''))}"></div><div><label>商户 Key</label><input class="input" name="epay_key" value="{h(st.get('epay_key',''))}"></div><div><label>域名</label><input class="input" name="domain" value="{h(st.get('domain',''))}"></div><div><label>公网 Base URL</label><input class="input" name="public_base_url" value="{h(st.get('public_base_url',''))}"></div></div><button class="btn">保存易支付配置</button></form>
 <h3>SMTP 邮件配置</h3><form method="post"><input type="hidden" name="act" value="save_smtp"><div class="grid"><div><label>启用 SMTP</label><select class="input" name="smtp_enabled"><option value="0" {sel(st.get('smtp_enabled'),'0')}>禁用</option><option value="1" {sel(st.get('smtp_enabled'),'1')}>启用</option></select></div><div><label>SMTP Host</label><input class="input" name="smtp_host" value="{h(st.get('smtp_host',''))}" placeholder="smtp.example.com"></div><div><label>端口</label><input class="input" name="smtp_port" value="{h(st.get('smtp_port','587'))}"></div><div><label>加密</label><select class="input" name="smtp_encryption"><option value="tls" {sel(st.get('smtp_encryption'),'tls')}>TLS/STARTTLS</option><option value="ssl" {sel(st.get('smtp_encryption'),'ssl')}>SSL</option><option value="none" {sel(st.get('smtp_encryption'),'none')}>不加密</option></select></div><div><label>账号</label><input class="input" name="smtp_username" value="{h(st.get('smtp_username',''))}"></div><div><label>密码/授权码</label><input class="input" name="smtp_password" value="{h(st.get('smtp_password',''))}"></div><div><label>发件邮箱</label><input class="input" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"></div><div><label>发件名称</label><input class="input" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"></div></div><button class="btn">保存 SMTP 配置</button></form><form method="post"><input type="hidden" name="act" value="test_smtp"><input type="hidden" name="smtp_enabled" value="{h(st.get('smtp_enabled','0'))}"><input type="hidden" name="smtp_host" value="{h(st.get('smtp_host',''))}"><input type="hidden" name="smtp_port" value="{h(st.get('smtp_port','587'))}"><input type="hidden" name="smtp_username" value="{h(st.get('smtp_username',''))}"><input type="hidden" name="smtp_password" value="{h(st.get('smtp_password',''))}"><input type="hidden" name="smtp_encryption" value="{h(st.get('smtp_encryption','tls'))}"><input type="hidden" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"><input type="hidden" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"><div class="grid"><div><label>测试收件邮箱</label><input class="input" name="test_email" value="{h(current_user()['email'] or '')}"></div></div><button class="btn btn2">发送测试邮件</button></form>
-<h3>模型配置管理（三方 OpenAI 兼容/Ollama 中转）</h3><p class="muted">OpenAI 兼容供应商支持填写 Base URL + API Key 后自动请求 <code>/models</code> 批量导入模型 ID。</p>{discover_form}<table width="100%"><tr><th>ID</th><th>名称</th><th>类型</th><th>Base URL</th><th>API Key</th><th>模型ID</th><th>显示名</th><th>状态</th><th>排序/超时</th><th>操作</th></tr>{model_html}{new_model}</table>
+{openai_compat_docs_html(st.get('public_base_url') or PUBLIC_BASE_URL)}<h3>模型配置管理（三方 OpenAI 兼容/Ollama 中转）</h3><p class="muted">OpenAI 兼容供应商支持填写 Base URL + API Key 后自动请求 <code>/models</code> 批量导入模型 ID；多模态能力请按上游真实能力勾选，网关会据此做路由过滤。</p>{discover_form}<table width="100%"><tr><th>ID</th><th>名称/协议</th><th>类型</th><th>Base URL/扩展</th><th>API Key</th><th>模型ID/显示名</th><th>状态</th><th>能力</th><th>排序/超时/Token</th><th>操作</th></tr>{model_html}{new_model}</table>
 <h3>套餐 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>价格</th><th>日额度</th><th>RPM</th><th>天数</th><th>状态</th><th>排序</th><th>说明</th><th>操作</th></tr>{plan_html}{new_plan}</table>
 <h3>管理项目 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>Slug</th><th>说明</th><th>链接</th><th>状态</th><th>排序</th><th>操作</th></tr>{proj_html}{new_proj}</table>
 <h3>用户 / 套餐 / 额度</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>套餐</th><th>自定义额度 / Key数</th><th>到期</th><th>余额</th><th>状态</th><th>今日已用</th><th>操作</th></tr>{uh}</table>
