@@ -121,3 +121,17 @@ curl https://newapi.example.com/v1/chat/completions \
 - 首次部署必须修改 `ADMIN_PASSWORD` 和 `FLASK_SECRET_KEY`。
 - SMTP 授权码、第三方 API Key、易支付密钥只在后台或服务器 `.env` 配置。
 - QQ 邮箱 `smtp.qq.com:465` 使用 SSL；程序已对 465 端口自动按 SSL 处理。
+
+
+## 多协议 / 多模态中转
+
+本项目对外保持 OpenAI 兼容，当前支持：
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `POST /v1/messages`
+
+后台模型配置可为每个上游设置协议类型（OpenAI Chat / OpenAI Responses / Anthropic Messages）、模态能力（文本、图片、视频、音频）、stream/tools 支持以及 token 上限。网关会在调用前按能力过滤模型，并在不同协议之间做基础请求/响应转换。
+
+详细部署和配置见 [DEPLOY.md](./DEPLOY.md)。

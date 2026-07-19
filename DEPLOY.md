@@ -46,6 +46,7 @@ bash deploy-safe.sh
 脚本会：
 
 - 创建 `/opt/llm-platform/{gateway,data,logs}`
+- 如已有 `/opt/llm-platform/data/platform.db`，先自动备份为 `platform.db.时间.bak`
 - 创建 Python venv
 - 安装 `requirements.txt`
 - 复制 `gateway.py`
@@ -247,7 +248,7 @@ git pull
 bash deploy-safe.sh
 ```
 
-脚本不会覆盖已有 `/opt/llm-platform/.env` 和 `/opt/llm-platform/data/platform.db`。
+脚本不会覆盖已有 `/opt/llm-platform/.env` 和 `/opt/llm-platform/data/platform.db`，并会在升级前自动备份现有 SQLite 数据库。
 
 升级前建议备份数据库：
 
@@ -286,6 +287,78 @@ cp /opt/llm-platform/data/platform.db /opt/llm-platform/data/platform.db.$(date 
 ```
 
 建议后台将稳定的第三方模型设为默认；本地 Ollama 无论排序如何都会作为最后兜底，避免慢速本地模型抢先响应。
+
+
+## 14. 多协议 / 多模态模型配置
+
+本版本支持把不同上游协议统一中转为 OpenAI 兼容出口。已开放：
+
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+- `POST /v1/messages`
+- `GET /v1/models`
+
+后台“模型配置管理”新增字段：
+
+- 协议类型：
+  - `OpenAI Chat`：上游路径 `{Base URL}/chat/completions`
+  - `OpenAI Responses`：上游路径 `{Base URL}/responses`
+  - `Anthropic Messages`：上游路径 `{Base URL}/messages`
+- 能力：文本 / 图片 / 视频 / 音频
+- `stream` 支持
+- `tools` 支持
+- 输入/输出 token 上限
+- `extra_config`：JSON 扩展配置，例如 Anthropic 版本号
+
+配置示例：
+
+```json
+{"anthropic_version":"2023-06-01"}
+```
+
+中转行为：
+
+- 调用 `/v1/chat/completions` 时，如果选中的上游是 `responses`，会自动把 `messages` 转为 `input`，再把上游 Responses 结果包装成 Chat Completions 响应。
+- 调用 `/v1/responses` 时，如果选中的上游是 Chat Completions，会自动把 `input` 转为 `messages`，再把上游 Chat 结果包装成 Responses 响应。
+- 调用 `/v1/messages` 时，只选择 `Anthropic Messages` 类型模型。
+- 请求包含图片/视频/音频/tools/stream 时，会先按后台能力配置过滤模型；不支持则提前返回 `unsupported_modality` / capability error，不盲目转发。
+- `stream=true` 仍只使用第一个匹配模型，不做中途故障切换。
+
+图片请求示例：
+
+```bash
+curl https://newapi.example.com/v1/chat/completions \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "auto",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type":"text","text":"描述这张图片"},
+        {"type":"image_url","image_url":{"url":"https://example.com/a.jpg"}}
+      ]
+    }]
+  }'
+```
+
+Responses 请求示例：
+
+```bash
+curl https://newapi.example.com/v1/responses \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"auto","input":"Say OK"}'
+```
+
+Anthropic Messages 请求示例：
+
+```bash
+curl https://newapi.example.com/v1/messages \
+  -H 'Authorization: Bearer YOUR_API_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"Say OK"}],"max_tokens":256}'
+```
 
 
 ## Docker 部署

@@ -100,12 +100,25 @@ CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id 
 CREATE TABLE IF NOT EXISTS ticket_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,ticket_id INTEGER NOT NULL,user_id INTEGER,author_role TEXT DEFAULT 'user',message TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(ticket_id) REFERENCES tickets(id),FOREIGN KEY(user_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY,name TEXT NOT NULL,price REAL DEFAULT 0,daily_tokens INTEGER DEFAULT 0,rate_limit INTEGER DEFAULT 60,days INTEGER DEFAULT 30,is_active INTEGER DEFAULT 1,sort_order INTEGER DEFAULT 100,description TEXT DEFAULT '',updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS managed_projects(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,slug TEXT UNIQUE NOT NULL,description TEXT DEFAULT '',base_url TEXT DEFAULT '',status TEXT DEFAULT 'active',sort_order INTEGER DEFAULT 100,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS model_providers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,provider_type TEXT DEFAULT 'openai',base_url TEXT DEFAULT '',api_key TEXT DEFAULT '',model_id TEXT NOT NULL,display_name TEXT DEFAULT '',is_default INTEGER DEFAULT 0,is_active INTEGER DEFAULT 1,sort_order INTEGER DEFAULT 100,timeout_seconds INTEGER DEFAULT 300,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS model_providers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,provider_type TEXT DEFAULT 'openai',base_url TEXT DEFAULT '',api_key TEXT DEFAULT '',model_id TEXT NOT NULL,display_name TEXT DEFAULT '',is_default INTEGER DEFAULT 0,is_active INTEGER DEFAULT 1,sort_order INTEGER DEFAULT 100,timeout_seconds INTEGER DEFAULT 300,endpoint_type TEXT DEFAULT 'chat_completions',modalities TEXT DEFAULT '["text"]',supports_stream INTEGER DEFAULT 1,supports_tools INTEGER DEFAULT 0,supports_vision INTEGER DEFAULT 0,supports_video INTEGER DEFAULT 0,max_input_tokens INTEGER,max_output_tokens INTEGER,extra_config TEXT DEFAULT '{}',created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS invoices(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,order_id INTEGER NOT NULL,invoice_no TEXT UNIQUE NOT NULL,company_name TEXT NOT NULL,tax_id TEXT,amount REAL NOT NULL,status TEXT DEFAULT 'pending',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(user_id) REFERENCES users(id),FOREIGN KEY(order_id) REFERENCES orders(id));
 CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY,value TEXT DEFAULT '',updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS email_activations(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,email TEXT NOT NULL,token TEXT UNIQUE NOT NULL,expires_at TEXT NOT NULL,used_at TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(user_id) REFERENCES users(id));
 ''')
     for ddl in ['ALTER TABLE users ADD COLUMN daily_token_limit INTEGER','ALTER TABLE users ADD COLUMN custom_rate_limit INTEGER','ALTER TABLE users ADD COLUMN max_api_keys INTEGER DEFAULT 5','ALTER TABLE users ADD COLUMN email_verified_at TEXT','ALTER TABLE api_keys ADD COLUMN quota_daily INTEGER','ALTER TABLE api_keys ADD COLUMN key_plain TEXT']:
+        try: c.execute(ddl)
+        except sqlite3.OperationalError: pass
+    for ddl in [
+        "ALTER TABLE model_providers ADD COLUMN endpoint_type TEXT DEFAULT 'chat_completions'",
+        "ALTER TABLE model_providers ADD COLUMN modalities TEXT DEFAULT '[\"text\"]'",
+        'ALTER TABLE model_providers ADD COLUMN supports_stream INTEGER DEFAULT 1',
+        'ALTER TABLE model_providers ADD COLUMN supports_tools INTEGER DEFAULT 0',
+        'ALTER TABLE model_providers ADD COLUMN supports_vision INTEGER DEFAULT 0',
+        'ALTER TABLE model_providers ADD COLUMN supports_video INTEGER DEFAULT 0',
+        'ALTER TABLE model_providers ADD COLUMN max_input_tokens INTEGER',
+        'ALTER TABLE model_providers ADD COLUMN max_output_tokens INTEGER',
+        "ALTER TABLE model_providers ADD COLUMN extra_config TEXT DEFAULT '{}'"
+    ]:
         try: c.execute(ddl)
         except sqlite3.OperationalError: pass
     for k,v in {'epay_api_url': EPAY_API_URL, 'epay_pid': EPAY_PID, 'epay_key': EPAY_KEY, 'domain': DOMAIN, 'public_base_url': PUBLIC_BASE_URL, 'payment_enabled': '0' if not (EPAY_API_URL and EPAY_PID and EPAY_KEY) else '1', 'smtp_enabled': '0', 'smtp_host': '', 'smtp_port': '587', 'smtp_username': '', 'smtp_password': '', 'smtp_encryption': 'tls', 'smtp_from_email': '', 'smtp_from_name': 'LLM Platform'}.items():
@@ -204,8 +217,36 @@ def send_activation_email(user_id, email):
     html=f'''<div style="font-family:Arial,sans-serif;max-width:640px;margin:auto;line-height:1.7;color:#111827"><h2>激活你的账号</h2><p>感谢注册 LLM Platform。请点击下面按钮完成邮箱验证并激活账号：</p><p><a href="{h(url)}" style="display:inline-block;background:#2563eb;color:#fff;padding:12px 20px;border-radius:8px;text-decoration:none">激活账号</a></p><p>如果按钮打不开，请复制链接到浏览器：</p><p style="word-break:break-all;color:#2563eb">{h(url)}</p><p style="color:#6b7280">链接 24 小时内有效。如非本人操作，请忽略。</p></div>'''
     send_mail(email,'激活你的 LLM Platform 账号',html)
 
+def content_text(content):
+    if isinstance(content, str): return content
+    if isinstance(content, list):
+        parts=[]
+        for part in content:
+            if not isinstance(part, dict): continue
+            if part.get('type') in ('text','input_text','output_text'): parts.append(str(part.get('text','')))
+            elif part.get('type') in ('image_url','input_image'): parts.append('[image]')
+            elif part.get('type') in ('video_url','input_video'): parts.append('[video]')
+            elif part.get('type') in ('audio_url','input_audio'): parts.append('[audio]')
+        return '\n'.join(parts)
+    return str(content or '')
+
 def token_count(messages):
-    return sum(len((m.get('content') or '')) for m in messages)//2+1
+    total_chars=0
+    for m in messages or []:
+        if not isinstance(m, dict): continue
+        content=m.get('content', m.get('input', ''))
+        if isinstance(content, str): total_chars += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, str): total_chars += len(part); continue
+                if not isinstance(part, dict): continue
+                ptype=part.get('type','')
+                if ptype in ('text','input_text','output_text'): total_chars += len(part.get('text') or '')
+                elif ptype in ('image_url','input_image'): total_chars += 1000
+                elif ptype in ('video_url','input_video'): total_chars += 5000
+                elif ptype in ('audio_url','input_audio'): total_chars += 3000
+        else: total_chars += len(str(content or ''))
+    return total_chars//2+1
 
 def api_auth():
     auth=request.headers.get('Authorization','')
@@ -227,13 +268,9 @@ def candidate_model_rows(requested):
     rows=list(active_model_rows())
     if not rows: return []
     def prefer_remote(row):
-        # Auto mode policy: third-party/OpenAI-compatible providers first, local Ollama last.
-        # Keep admin priority inside each group.
         return 1 if row['provider_type']=='ollama' else 0
     rows=sorted(rows, key=lambda r: (prefer_remote(r), 0 if r['is_default'] else 1, int(r['sort_order'] or 100), int(r['id'])))
     req=(requested or '').strip()
-    # "auto" means: try third-party models by priority, then local Ollama as final fallback.
-    # Empty model behaves the same as auto.
     if not req or req.lower() in ('auto','auto:fallback','fallback'):
         return rows
     exact=[]; rest=[]
@@ -246,12 +283,157 @@ def select_model(requested):
     rows=candidate_model_rows(requested)
     return rows[0] if rows else None
 
-def proxy_openai(provider, payload, key, input_tokens, start):
-    con=db(); url=(provider['base_url'] or '').rstrip('/')
+def get_provider_endpoint_type(provider):
+    try: return provider['endpoint_type'] or 'chat_completions'
+    except Exception: return 'chat_completions'
+
+def get_provider_modalities(provider):
+    try:
+        mods=json.loads(provider['modalities'] or '["text"]')
+        return set(str(x).lower() for x in mods) if isinstance(mods, list) else {'text'}
+    except Exception:
+        return {'text'}
+
+def get_provider_extra(provider):
+    try:
+        extra=json.loads(provider['extra_config'] or '{}')
+        return extra if isinstance(extra, dict) else {}
+    except Exception:
+        return {}
+
+def detect_modalities_from_payload(payload):
+    mods={'text'}
+    raw=json.dumps(payload.get('messages') or payload.get('input') or '', ensure_ascii=False)
+    if 'image_url' in raw or 'input_image' in raw or 'data:image/' in raw: mods.add('image')
+    if 'video_url' in raw or 'input_video' in raw or 'data:video/' in raw: mods.add('video')
+    if 'audio_url' in raw or 'input_audio' in raw or 'data:audio/' in raw: mods.add('audio')
+    return mods
+
+def filter_candidates_by_capability(candidates, payload, endpoint_types=None):
+    required=detect_modalities_from_payload(payload)
+    filtered=[]
+    for p in candidates:
+        et=get_provider_endpoint_type(p)
+        if endpoint_types and et not in endpoint_types:
+            continue
+        if not required.issubset(get_provider_modalities(p)):
+            continue
+        if payload.get('stream') and not int(p['supports_stream'] if 'supports_stream' in p.keys() else 1):
+            continue
+        if payload.get('tools') and not int(p['supports_tools'] if 'supports_tools' in p.keys() else 0):
+            continue
+        filtered.append(p)
+    return filtered
+
+def chat_messages_to_responses_input(messages):
+    result=[]
+    for msg in messages or []:
+        if not isinstance(msg, dict): continue
+        role=msg.get('role','user')
+        content=msg.get('content','')
+        if isinstance(content, str):
+            parts=[{'type':'input_text','text':content}]
+        elif isinstance(content, list):
+            parts=[]
+            for part in content:
+                if isinstance(part, str): parts.append({'type':'input_text','text':part}); continue
+                if not isinstance(part, dict): continue
+                ptype=part.get('type')
+                if ptype in ('text','input_text'):
+                    parts.append({'type':'input_text','text':part.get('text','')})
+                elif ptype in ('image_url','input_image'):
+                    image_url=part.get('image_url') or part.get('url') or part.get('image') or ''
+                    if isinstance(image_url, dict): image_url=image_url.get('url','')
+                    parts.append({'type':'input_image','image_url':image_url})
+                elif ptype in ('video_url','input_video'):
+                    video_url=part.get('video_url') or part.get('url') or ''
+                    if isinstance(video_url, dict): video_url=video_url.get('url','')
+                    parts.append({'type':'input_video','video_url':video_url})
+                elif ptype in ('audio_url','input_audio'):
+                    audio_url=part.get('audio_url') or part.get('url') or ''
+                    if isinstance(audio_url, dict): audio_url=audio_url.get('url','')
+                    parts.append({'type':'input_audio','audio_url':audio_url})
+        else:
+            parts=[{'type':'input_text','text':str(content or '')}]
+        result.append({'role':role,'content':parts})
+    return result
+
+def responses_input_to_chat_messages(input_data):
+    if isinstance(input_data, str): return [{'role':'user','content':input_data}]
+    messages=[]
+    for item in input_data or []:
+        if isinstance(item, str): messages.append({'role':'user','content':item}); continue
+        if not isinstance(item, dict): continue
+        role=item.get('role','user'); content=item.get('content', item.get('input',''))
+        if isinstance(content, str): messages.append({'role':role,'content':content}); continue
+        parts=[]
+        for part in content or []:
+            if isinstance(part, str): parts.append({'type':'text','text':part}); continue
+            if not isinstance(part, dict): continue
+            ptype=part.get('type')
+            if ptype in ('input_text','text'):
+                parts.append({'type':'text','text':part.get('text','')})
+            elif ptype in ('input_image','image_url'):
+                url=part.get('image_url') or part.get('url') or ''
+                parts.append({'type':'image_url','image_url':{'url':url}})
+            elif ptype in ('input_video','video_url'):
+                url=part.get('video_url') or part.get('url') or ''
+                parts.append({'type':'video_url','video_url':url})
+        messages.append({'role':role,'content':parts if parts else ''})
+    return messages
+
+def extract_responses_text(data):
+    if not isinstance(data, dict): return ''
+    if data.get('output_text'): return data.get('output_text') or ''
+    text=''
+    for item in data.get('output',[]) or []:
+        if not isinstance(item, dict): continue
+        for part in item.get('content',[]) or []:
+            if isinstance(part, dict) and part.get('type') in ('output_text','text'):
+                text += part.get('text','') or ''
+    return text
+
+def responses_to_chat_completion(data, model):
+    text=extract_responses_text(data)
+    usage=data.get('usage') or {} if isinstance(data,dict) else {}
+    if 'input_tokens' in usage or 'output_tokens' in usage:
+        usage={'prompt_tokens':usage.get('prompt_tokens',usage.get('input_tokens',0)),'completion_tokens':usage.get('completion_tokens',usage.get('output_tokens',0)),'total_tokens':usage.get('total_tokens',(usage.get('input_tokens') or 0)+(usage.get('output_tokens') or 0))}
+    return {'id':data.get('id','chatcmpl-proxy') if isinstance(data,dict) else 'chatcmpl-proxy','object':'chat.completion','created':int(time.time()),'model':model,'choices':[{'index':0,'message':{'role':'assistant','content':text},'finish_reason':'stop'}],'usage':usage}
+
+def chat_completion_to_response(data, model):
+    content=''
+    try: content=data.get('choices',[{}])[0].get('message',{}).get('content','') or ''
+    except Exception: pass
+    usage=data.get('usage') or {}
+    return {'id':data.get('id','resp-proxy'),'object':'response','created_at':time.time(),'model':data.get('model') or model,'output_text':content,'output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':content}]}],'usage':{'input_tokens':usage.get('prompt_tokens',0),'output_tokens':usage.get('completion_tokens',0),'total_tokens':usage.get('total_tokens',0)}}
+
+def check_quota_and_reset(key, input_tokens):
+    today=dt.date.today().isoformat(); con=db()
+    if key['tokens_reset_date']!=today:
+        con.execute('UPDATE users SET tokens_used_today=0,tokens_reset_date=? WHERE id=?',(today,key['user_id'])); con.commit(); used=0
+    else: used=key['tokens_used_today']
+    plan_limit=get_plan_config(True).get(key['plan'],PLAN_CONFIG['free'])['daily_tokens']; limits=[plan_limit]
+    if key['daily_token_limit']: limits.append(int(key['daily_token_limit']))
+    if key['quota_daily']: limits.append(int(key['quota_daily']))
+    if used+input_tokens>min(limits): return jsonify({'error':{'message':'Daily token quota exceeded','type':'quota_error'}}),429
+    return None
+
+def record_usage(key, input_tokens, output_tokens, model, endpoint, start):
+    con=db(); total=int(input_tokens or 0)+int(output_tokens or 0); dur=int((time.time()-start)*1000)
+    con.execute('UPDATE users SET tokens_used_today=tokens_used_today+? WHERE id=?',(total,key['user_id']))
+    con.execute('UPDATE api_keys SET last_used_at=CURRENT_TIMESTAMP WHERE id=?',(key['id'],))
+    con.execute('INSERT INTO usage_logs(user_id,api_key_id,tokens_input,tokens_output,model,endpoint,duration_ms,ip_address) VALUES(?,?,?,?,?,?,?,?)',(key['user_id'],key['id'],input_tokens,output_tokens,model,endpoint,dur,request.remote_addr))
+    con.commit()
+
+def proxy_chat_completions_provider(provider, payload, key, input_tokens, start, target_api='chat_completions'):
+    url=(provider['base_url'] or '').rstrip('/')
     if not url: raise RuntimeError('第三方模型 Base URL 为空')
     headers={'Content-Type':'application/json'}
     if provider['api_key']: headers['Authorization']='Bearer '+provider['api_key']
     out=dict(payload); out['model']=provider['model_id']
+    if 'messages' not in out and 'input' in out:
+        out['messages']=responses_input_to_chat_messages(out.get('input'))
+    out.pop('input', None)
     r=requests.post(url+'/chat/completions',headers=headers,json=out,timeout=int(provider['timeout_seconds'] or 300),stream=bool(out.get('stream')))
     if not r.ok: raise RuntimeError(f"{provider['name']} upstream HTTP {r.status_code}: {r.text[:500]}")
     if out.get('stream'):
@@ -259,17 +441,118 @@ def proxy_openai(provider, payload, key, input_tokens, start):
             for chunk in r.iter_content(chunk_size=None):
                 if chunk: yield chunk
         return Response(gen(), mimetype=r.headers.get('content-type','text/event-stream'))
-    data=r.json(); content=''
+    data=r.json()
+    if 'model' not in data: data['model']=provider['model_id']
+    response_data=chat_completion_to_response(data,provider['model_id']) if target_api=='responses' else data
+    content=''
     try: content=data.get('choices',[{}])[0].get('message',{}).get('content','') or ''
     except Exception: pass
-    usage=data.get('usage') or {}; out_tokens=int(usage.get('completion_tokens') or max(1,len(content)//2)); total=int(usage.get('total_tokens') or input_tokens+out_tokens)
-    dur=int((time.time()-start)*1000)
-    con.execute('UPDATE users SET tokens_used_today=tokens_used_today+? WHERE id=?',(total,key['user_id']))
-    con.execute('UPDATE api_keys SET last_used_at=CURRENT_TIMESTAMP WHERE id=?',(key['id'],))
-    con.execute('INSERT INTO usage_logs(user_id,api_key_id,tokens_input,tokens_output,model,endpoint,duration_ms,ip_address) VALUES(?,?,?,?,?,?,?,?)',(key['user_id'],key['id'],input_tokens,out_tokens,provider['model_id'],'/v1/chat/completions',dur,request.remote_addr))
-    con.commit()
-    if 'model' not in data: data['model']=provider['model_id']
+    usage=data.get('usage') or {}; out_tokens=int(usage.get('completion_tokens') or max(1,len(content)//2))
+    record_usage(key,input_tokens,out_tokens,provider['model_id'],'/v1/chat/completions',start)
+    return jsonify(response_data)
+
+def proxy_responses_stream(r, provider, target_api='responses'):
+    if target_api=='responses':
+        def passthrough():
+            for chunk in r.iter_content(chunk_size=None):
+                if chunk: yield chunk
+        return Response(passthrough(), mimetype=r.headers.get('content-type','text/event-stream'))
+    def gen():
+        for line in r.iter_lines():
+            if not line: continue
+            text=line.decode(errors='ignore')
+            if not text.startswith('data:'):
+                continue
+            data=text[5:].strip()
+            if data=='[DONE]':
+                yield 'data: [DONE]\n\n'; continue
+            try: obj=json.loads(data)
+            except Exception: continue
+            delta=''
+            if obj.get('type') in ('response.output_text.delta','response.refusal.delta'): delta=obj.get('delta','') or ''
+            if delta:
+                yield 'data: '+json.dumps({'id':obj.get('response_id','chatcmpl-proxy'),'object':'chat.completion.chunk','created':int(time.time()),'model':provider['model_id'],'choices':[{'index':0,'delta':{'content':delta},'finish_reason':None}]},ensure_ascii=False)+'\n\n'
+        yield 'data: [DONE]\n\n'
+    return Response(gen(),mimetype='text/event-stream')
+
+def proxy_responses_provider(provider, payload, key, input_tokens, start, target_api='responses'):
+    url=(provider['base_url'] or '').rstrip('/')
+    if not url: raise RuntimeError('第三方模型 Base URL 为空')
+    headers={'Content-Type':'application/json'}
+    if provider['api_key']: headers['Authorization']='Bearer '+provider['api_key']
+    out=dict(payload); out['model']=provider['model_id']
+    if 'input' not in out and 'messages' in out:
+        out['input']=chat_messages_to_responses_input(out.get('messages') or [])
+    out.pop('messages',None)
+    r=requests.post(url+'/responses',headers=headers,json=out,timeout=int(provider['timeout_seconds'] or 300),stream=bool(out.get('stream')))
+    if not r.ok: raise RuntimeError(f"{provider['name']} upstream HTTP {r.status_code}: {r.text[:500]}")
+    if out.get('stream'):
+        return proxy_responses_stream(r,provider,target_api)
+    data=r.json()
+    response_data=responses_to_chat_completion(data,provider['model_id']) if target_api=='chat_completions' else data
+    usage=response_data.get('usage') or data.get('usage') or {}
+    out_tokens=int(usage.get('completion_tokens') or usage.get('output_tokens') or max(1,len(extract_responses_text(data))//2) or 1)
+    record_usage(key,input_tokens,out_tokens,provider['model_id'],'/v1/responses',start)
+    return jsonify(response_data)
+
+def anthropic_to_chat_completion(data, model):
+    text=''
+    for part in data.get('content',[]) or []:
+        if isinstance(part,dict) and part.get('type')=='text': text += part.get('text','') or ''
+    usage=data.get('usage') or {}
+    return {'id':data.get('id','chatcmpl-anthropic-proxy'),'object':'chat.completion','created':int(time.time()),'model':model,'choices':[{'index':0,'message':{'role':'assistant','content':text},'finish_reason':data.get('stop_reason') or 'stop'}],'usage':{'prompt_tokens':usage.get('input_tokens',0),'completion_tokens':usage.get('output_tokens',0),'total_tokens':(usage.get('input_tokens') or 0)+(usage.get('output_tokens') or 0)}}
+
+def proxy_anthropic_messages_provider(provider, payload, key, input_tokens, start, target_api='messages'):
+    url=(provider['base_url'] or '').rstrip('/')
+    if not url: raise RuntimeError('第三方模型 Base URL 为空')
+    extra=get_provider_extra(provider); auth_type=extra.get('auth_type','x-api-key')
+    headers={'Content-Type':'application/json','anthropic-version':extra.get('anthropic_version','2023-06-01')}
+    if provider['api_key']:
+        if auth_type=='bearer': headers['Authorization']='Bearer '+provider['api_key']
+        else: headers['x-api-key']=provider['api_key']
+    out=dict(payload); out['model']=provider['model_id']
+    if 'messages' not in out and 'input' in out:
+        out['messages']=responses_input_to_chat_messages(out.get('input'))
+    if 'max_tokens' not in out: out['max_tokens']=int(provider['max_output_tokens'] or 1024) if 'max_output_tokens' in provider.keys() else 1024
+    r=requests.post(url+'/messages',headers=headers,json=out,timeout=int(provider['timeout_seconds'] or 300),stream=bool(out.get('stream')))
+    if not r.ok: raise RuntimeError(f"{provider['name']} upstream HTTP {r.status_code}: {r.text[:500]}")
+    if out.get('stream'):
+        def gen():
+            for chunk in r.iter_content(chunk_size=None):
+                if chunk: yield chunk
+        return Response(gen(),mimetype=r.headers.get('content-type','text/event-stream'))
+    data=r.json(); text=''
+    for part in data.get('content',[]) or []:
+        if isinstance(part,dict) and part.get('type')=='text': text += part.get('text','') or ''
+    usage=data.get('usage') or {}; out_tokens=int(usage.get('output_tokens') or max(1,len(text)//2))
+    record_usage(key,input_tokens,out_tokens,provider['model_id'],'/v1/messages',start)
+    if target_api=='chat_completions': return jsonify(anthropic_to_chat_completion(data,provider['model_id']))
     return jsonify(data)
+
+
+def proxy_ollama_as_response(provider, payload, key, input_tokens, start):
+    payload2=dict(payload)
+    if 'messages' not in payload2:
+        payload2['messages']=responses_input_to_chat_messages(payload2.get('input',''))
+    payload2['stream']=False
+    base=(provider['base_url'] or OLLAMA_BASE_URL).rstrip('/'); model=provider['model_id'] or MODEL_NAME
+    model_latest=model if model.endswith(':latest') or ':' in model else model+':latest'
+    prompt='\n'.join([str(m.get('role','user'))+': '+content_text(m.get('content','')) for m in payload2.get('messages') or []])
+    r=requests.post(base+'/api/generate',json={'model':model_latest,'prompt':prompt,'stream':False,'options':{'temperature':payload.get('temperature',0.7)}},timeout=int(provider['timeout_seconds'] or 300))
+    if not r.ok: raise RuntimeError(r.text)
+    obj=r.json(); content=obj.get('response',''); out_tokens=max(1,len(content)//2)
+    record_usage(key,input_tokens,out_tokens,model,'/v1/responses',start)
+    return jsonify({'id':'resp-local','object':'response','created_at':time.time(),'model':model,'output_text':content,'output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':content}]}],'usage':{'input_tokens':input_tokens,'output_tokens':out_tokens,'total_tokens':input_tokens+out_tokens}})
+
+def proxy_provider(provider, payload, key, input_tokens, start, target_api='chat_completions'):
+    if provider['provider_type']=='ollama':
+        if target_api=='responses':
+            return proxy_ollama_as_response(provider,payload,key,input_tokens,start)
+        return proxy_ollama(provider,payload,key,input_tokens,start)
+    endpoint_type=get_provider_endpoint_type(provider)
+    if endpoint_type=='responses': return proxy_responses_provider(provider,payload,key,input_tokens,start,target_api)
+    if endpoint_type=='anthropic_messages': return proxy_anthropic_messages_provider(provider,payload,key,input_tokens,start,target_api)
+    return proxy_chat_completions_provider(provider,payload,key,input_tokens,start,target_api)
 
 def proxy_ollama(provider, payload, key, input_tokens, start):
     con=db(); messages=payload.get('messages') or []
@@ -370,12 +653,18 @@ def format_playground_result(provider, response_text, elapsed_ms=None):
                 msg=ch.get('message') or {}
                 answer=msg.get('content') or ch.get('text') or ''
                 finish=ch.get('finish_reason') or ''
+            elif data.get('output_text'):
+                answer=data.get('output_text') or ''
+                finish=data.get('status') or ''
+            elif isinstance(data.get('content'),list):
+                answer=''.join([x.get('text','') for x in data.get('content') if isinstance(x,dict) and x.get('type')=='text'])
+                finish=data.get('stop_reason') or ''
             elif 'response' in data:
                 answer=data.get('response') or ''
                 finish='done' if data.get('done') else ''
             u=data.get('usage') or {}
             if isinstance(u,dict):
-                for label,key in [('输入','prompt_tokens'),('输出','completion_tokens'),('总计','total_tokens')]:
+                for label,key in [('输入','prompt_tokens'),('输出','completion_tokens'),('总计','total_tokens'),('输入','input_tokens'),('输出','output_tokens')]:
                     if key in u: usage.append(f'{label} {h(str(u[key]))}')
     except Exception:
         answer=raw
@@ -400,19 +689,25 @@ def playground():
         else: raw=k['key_prefix']+'...（已有 Key，完整值只在创建时显示）'
         try:
             errors=[]
-            for provider in candidate_model_rows(request.form.get('model')):
+            for provider in filter_candidates_by_capability(candidate_model_rows(request.form.get('model')), {'messages':[{'role':'user','content':prompt}]}, None):
                 try:
-                    start_call=time.time()
-                    if provider and provider['provider_type']=='openai':
-                        rr=requests.post((provider['base_url'] or '').rstrip()+'/chat/completions',headers={'Authorization':'Bearer '+(provider['api_key'] or ''),'Content-Type':'application/json'},json={'model':provider['model_id'],'messages':[{'role':'user','content':prompt}],'temperature':0.4,'max_tokens':256},timeout=min(60,int(provider['timeout_seconds'] or 300)))
-                        if not rr.ok: raise RuntimeError(f'HTTP {rr.status_code}: {rr.text[:300]}')
-                        result=format_playground_result(provider, rr.text, int((time.time()-start_call)*1000)); break
-                    else:
+                    start_call=time.time(); endpoint=get_provider_endpoint_type(provider)
+                    headers={'Content-Type':'application/json'}
+                    if provider['api_key']: headers['Authorization']='Bearer '+provider['api_key']
+                    if provider['provider_type']=='ollama':
                         model_id=(provider['model_id'] if provider else MODEL_NAME)
                         if not model_id.endswith(':latest') and ':' not in model_id: model_id=model_id+':latest'
                         rr=requests.post((provider['base_url'] if provider else OLLAMA_BASE_URL).rstrip()+'/api/generate',json={'model':model_id,'prompt':prompt,'stream':False},timeout=min(60,int(provider['timeout_seconds'] if provider else 300)))
-                        if not rr.ok: raise RuntimeError(f'HTTP {rr.status_code}: {rr.text[:300]}')
-                        result=format_playground_result(provider, rr.text, int((time.time()-start_call)*1000)); break
+                    elif endpoint=='responses':
+                        rr=requests.post((provider['base_url'] or '').rstrip()+'/responses',headers=headers,json={'model':provider['model_id'],'input':prompt,'temperature':0.4,'max_output_tokens':256},timeout=min(60,int(provider['timeout_seconds'] or 300)))
+                    elif endpoint=='anthropic_messages':
+                        extra=get_provider_extra(provider); headers={'Content-Type':'application/json','anthropic-version':extra.get('anthropic_version','2023-06-01')}
+                        if provider['api_key']: headers['x-api-key']=provider['api_key']
+                        rr=requests.post((provider['base_url'] or '').rstrip()+'/messages',headers=headers,json={'model':provider['model_id'],'messages':[{'role':'user','content':prompt}],'max_tokens':256},timeout=min(60,int(provider['timeout_seconds'] or 300)))
+                    else:
+                        rr=requests.post((provider['base_url'] or '').rstrip()+'/chat/completions',headers=headers,json={'model':provider['model_id'],'messages':[{'role':'user','content':prompt}],'temperature':0.4,'max_tokens':256},timeout=min(60,int(provider['timeout_seconds'] or 300)))
+                    if not rr.ok: raise RuntimeError(f'HTTP {rr.status_code}: {rr.text[:300]}')
+                    result=format_playground_result(provider, rr.text, int((time.time()-start_call)*1000)); break
                 except Exception as e:
                     errors.append('%s/%s：%s' % (provider['name'],provider['model_id'],str(e)[:200]))
             if not result: result='<div class="result-card"><div class="assistant-answer">'+h('所有候选模型均调用失败：\n'+'\n'.join(errors))+'</div></div>'
@@ -587,10 +882,14 @@ def admin():
         elif act=='delete_project': con.execute('DELETE FROM managed_projects WHERE id=?',(request.form.get('project_id'),)); con.commit(); msg='管理项目已删除'
         elif act=='save_model':
             mid=request.form.get('model_row_id')
-            vals=(request.form.get('name',''),request.form.get('provider_type','openai'),request.form.get('base_url','').rstrip('/'),request.form.get('api_key',''),request.form.get('model_id',''),request.form.get('display_name',''),1 if request.form.get('is_default')=='1' else 0,1 if request.form.get('is_active')=='1' else 0,int(request.form.get('sort_order') or 100),int(request.form.get('timeout_seconds') or 300))
+            modalities=[]
+            for m in ['text','image','video','audio']:
+                if request.form.get('mod_'+m)=='1': modalities.append(m)
+            if not modalities: modalities=['text']
+            vals=(request.form.get('name',''),request.form.get('provider_type','openai'),request.form.get('base_url','').rstrip('/'),request.form.get('api_key',''),request.form.get('model_id',''),request.form.get('display_name',''),1 if request.form.get('is_default')=='1' else 0,1 if request.form.get('is_active')=='1' else 0,int(request.form.get('sort_order') or 100),int(request.form.get('timeout_seconds') or 300),request.form.get('endpoint_type','chat_completions'),json.dumps(modalities,ensure_ascii=False),1 if request.form.get('supports_stream')=='1' else 0,1 if request.form.get('supports_tools')=='1' else 0,int(request.form.get('max_input_tokens') or 0) or None,int(request.form.get('max_output_tokens') or 0) or None,request.form.get('extra_config','{}') or '{}')
             if vals[6]: con.execute('UPDATE model_providers SET is_default=0')
-            if mid: con.execute('UPDATE model_providers SET name=?,provider_type=?,base_url=?,api_key=?,model_id=?,display_name=?,is_default=?,is_active=?,sort_order=?,timeout_seconds=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',vals+(mid,))
-            else: con.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds) VALUES(?,?,?,?,?,?,?,?,?,?)',vals)
+            if mid: con.execute('UPDATE model_providers SET name=?,provider_type=?,base_url=?,api_key=?,model_id=?,display_name=?,is_default=?,is_active=?,sort_order=?,timeout_seconds=?,endpoint_type=?,modalities=?,supports_stream=?,supports_tools=?,max_input_tokens=?,max_output_tokens=?,extra_config=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',vals+(mid,))
+            else: con.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds,endpoint_type,modalities,supports_stream,supports_tools,max_input_tokens,max_output_tokens,extra_config) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',vals)
             con.commit(); msg='模型配置已保存'
         elif act=='discover_models':
             name=request.form.get('name','第三方模型').strip() or '第三方模型'; base_url=request.form.get('base_url','').rstrip('/'); api_key=request.form.get('api_key',''); timeout=int(request.form.get('timeout_seconds') or 20); sort_order=int(request.form.get('sort_order') or 100)
@@ -598,7 +897,7 @@ def admin():
                 mids=fetch_openai_models(base_url,api_key,timeout); added=0
                 for mid in mids:
                     if not con.execute('SELECT 1 FROM model_providers WHERE provider_type=? AND base_url=? AND model_id=?',('openai',base_url,mid)).fetchone():
-                        con.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds) VALUES(?,?,?,?,?,?,?,?,?,?)',(name,'openai',base_url,api_key,mid,mid,0,1,sort_order,300)); added+=1
+                        con.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds,endpoint_type,modalities,supports_stream,supports_tools) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(name,'openai',base_url,api_key,mid,mid,0,1,sort_order,300,'chat_completions','["text"]',1,0)); added+=1
                 con.commit(); msg=f'已读取到 {len(mids)} 个模型，新增 {added} 个；已存在的自动跳过'
             except Exception as e: msg='读取模型失败：'+str(e)
         elif act=='delete_model': con.execute('DELETE FROM model_providers WHERE id=?',(request.form.get('model_row_id'),)); con.commit(); msg='模型配置已删除'
@@ -624,8 +923,11 @@ def admin():
     new_plan='<tr><td><form method="post"><input type="hidden" name="act" value="save_plan"><input class="input mini" name="id" placeholder="plan_id"></td><td><input class="input mini" name="name"></td><td><input class="input mini" name="price" value="0"></td><td><input class="input mini" name="daily_tokens" value="10000"></td><td><input class="input mini" name="rate_limit" value="60"></td><td><input class="input mini" name="days" value="30"></td><td><select name="is_active" class="input mini"><option value="1">启用</option><option value="0">禁用</option></select></td><td><input class="input mini" name="sort_order" value="100"></td><td><input class="input" name="description"></td><td><button class="btn">新增</button></form></td></tr>'
     proj_html=''.join([f'<tr><td>{p["id"]}<form method="post"><input type="hidden" name="act" value="save_project"><input type="hidden" name="project_id" value="{p["id"]}"></td><td><input class="input mini" name="name" value="{h(p["name"])}"></td><td><input class="input mini" name="slug" value="{h(p["slug"])}"></td><td><input class="input" name="description" value="{h(p["description"] or "")}"></td><td><input class="input" name="base_url" value="{h(p["base_url"] or "")}"></td><td><input class="input mini" name="status" value="{h(p["status"])}"></td><td><input class="input mini" name="sort_order" value="{h(p["sort_order"])}"></td><td><button class="btn">保存</button></form><form method="post"><input type="hidden" name="act" value="delete_project"><input type="hidden" name="project_id" value="{p["id"]}"><button class="btn btn-danger">删除</button></form></td></tr>' for p in projects])
     new_proj='<tr><td>新建<form method="post"><input type="hidden" name="act" value="save_project"></td><td><input class="input mini" name="name"></td><td><input class="input mini" name="slug"></td><td><input class="input" name="description"></td><td><input class="input" name="base_url"></td><td><input class="input mini" name="status" value="active"></td><td><input class="input mini" name="sort_order" value="100"></td><td><button class="btn">新增</button></form></td></tr>'
-    model_html=''.join([f'<tr><td>{m["id"]}<form method="post"><input type="hidden" name="act" value="save_model"><input type="hidden" name="model_row_id" value="{m["id"]}"></td><td><input class="input mini" name="name" value="{h(m["name"])}"></td><td><select class="input mini" name="provider_type"><option value="openai" {sel(m["provider_type"],"openai")}>OpenAI兼容</option><option value="ollama" {sel(m["provider_type"],"ollama")}>Ollama</option></select></td><td><input class="input" name="base_url" value="{h(m["base_url"])}" placeholder="https://api.xxx/v1 或 http://127.0.0.1:11434"></td><td><input class="input" name="api_key" value="{h(m["api_key"])}"></td><td><input class="input mini" name="model_id" value="{h(m["model_id"])}"></td><td><input class="input mini" name="display_name" value="{h(m["display_name"] or "")}"></td><td>{yn("is_default",m["is_default"])}{yn("is_active",m["is_active"])}</td><td><input class="input mini" name="sort_order" value="{h(m["sort_order"])}"><input class="input mini" name="timeout_seconds" value="{h(m["timeout_seconds"])}"></td><td><button class="btn">保存</button></form><form method="post"><input type="hidden" name="act" value="delete_model"><input type="hidden" name="model_row_id" value="{m["id"]}"><button class="btn btn-danger">删除</button></form></td></tr>' for m in model_rows])
-    new_model='<tr><td>新建<form method="post"><input type="hidden" name="act" value="save_model"></td><td><input class="input mini" name="name" placeholder="供应商名"></td><td><select class="input mini" name="provider_type"><option value="openai">OpenAI兼容</option><option value="ollama">Ollama</option></select></td><td><input class="input" name="base_url" placeholder="https://api.xxx/v1"></td><td><input class="input" name="api_key"></td><td><input class="input mini" name="model_id" placeholder="gpt-4o-mini"></td><td><input class="input mini" name="display_name"></td><td><select name="is_default" class="input mini"><option value="0">默认否</option><option value="1">默认是</option></select><select name="is_active" class="input mini"><option value="1">启用</option><option value="0">禁用</option></select></td><td><input class="input mini" name="sort_order" value="100"><input class="input mini" name="timeout_seconds" value="300"></td><td><button class="btn">新增</button></form></td></tr>'
+    def mod_checked(row,mod): return 'checked' if mod in get_provider_modalities(row) else ''
+    def endpoint_opts(cur):
+        return ''.join([f'<option value="{v}" {sel(cur,v)}>{label}</option>' for v,label in [('chat_completions','OpenAI Chat'),('responses','OpenAI Responses'),('anthropic_messages','Anthropic Messages')]])
+    model_html=''.join([f'''<tr><td>{m["id"]}<form method="post"><input type="hidden" name="act" value="save_model"><input type="hidden" name="model_row_id" value="{m["id"]}"></td><td><input class="input mini" name="name" value="{h(m["name"])}"><br><select class="input mini" name="endpoint_type">{endpoint_opts(get_provider_endpoint_type(m))}</select></td><td><select class="input mini" name="provider_type"><option value="openai" {sel(m["provider_type"],"openai")}>HTTP API</option><option value="ollama" {sel(m["provider_type"],"ollama")}>Ollama</option></select></td><td><input class="input" name="base_url" value="{h(m["base_url"])}" placeholder="https://api.xxx/v1"><br><input class="input" name="extra_config" value="{h(m["extra_config"] or '{}')}" placeholder='{{"anthropic_version":"2023-06-01"}}'></td><td><input class="input" name="api_key" value="{h(m["api_key"])}"></td><td><input class="input mini" name="model_id" value="{h(m["model_id"])}"><br><input class="input mini" name="display_name" value="{h(m["display_name"] or "")}"></td><td>{yn("is_default",m["is_default"])}{yn("is_active",m["is_active"])}</td><td><label><input type="checkbox" name="mod_text" value="1" {mod_checked(m,'text')}>文</label><label><input type="checkbox" name="mod_image" value="1" {mod_checked(m,'image')}>图</label><label><input type="checkbox" name="mod_video" value="1" {mod_checked(m,'video')}>视频</label><label><input type="checkbox" name="mod_audio" value="1" {mod_checked(m,'audio')}>音频</label><br>{yn("supports_stream",m["supports_stream"])}<span class="muted">stream</span>{yn("supports_tools",m["supports_tools"])}<span class="muted">tools</span></td><td><input class="input mini" name="sort_order" value="{h(m["sort_order"])}"><input class="input mini" name="timeout_seconds" value="{h(m["timeout_seconds"])}"><input class="input mini" name="max_input_tokens" value="{h(m["max_input_tokens"] or "")}" placeholder="输入token"><input class="input mini" name="max_output_tokens" value="{h(m["max_output_tokens"] or "")}" placeholder="输出token"></td><td><button class="btn">保存</button></form><form method="post"><input type="hidden" name="act" value="delete_model"><input type="hidden" name="model_row_id" value="{m["id"]}"><button class="btn btn-danger">删除</button></form></td></tr>''' for m in model_rows])
+    new_model='''<tr><td>新建<form method="post"><input type="hidden" name="act" value="save_model"></td><td><input class="input mini" name="name" placeholder="供应商名"><br><select class="input mini" name="endpoint_type"><option value="chat_completions">OpenAI Chat</option><option value="responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option></select></td><td><select class="input mini" name="provider_type"><option value="openai">HTTP API</option><option value="ollama">Ollama</option></select></td><td><input class="input" name="base_url" placeholder="https://api.xxx/v1"><br><input class="input" name="extra_config" value="{}"></td><td><input class="input" name="api_key"></td><td><input class="input mini" name="model_id" placeholder="gpt-4o-mini"><br><input class="input mini" name="display_name"></td><td><select name="is_default" class="input mini"><option value="0">默认否</option><option value="1">默认是</option></select><select name="is_active" class="input mini"><option value="1">启用</option><option value="0">禁用</option></select></td><td><label><input type="checkbox" name="mod_text" value="1" checked>文</label><label><input type="checkbox" name="mod_image" value="1">图</label><label><input type="checkbox" name="mod_video" value="1">视频</label><label><input type="checkbox" name="mod_audio" value="1">音频</label><br><select name="supports_stream" class="input mini"><option value="1">stream开</option><option value="0">stream关</option></select><select name="supports_tools" class="input mini"><option value="0">tools关</option><option value="1">tools开</option></select></td><td><input class="input mini" name="sort_order" value="100"><input class="input mini" name="timeout_seconds" value="300"><input class="input mini" name="max_input_tokens" placeholder="输入token"><input class="input mini" name="max_output_tokens" placeholder="输出token"></td><td><button class="btn">新增</button></form></td></tr>'''
     discover_form='''<form method="post"><input type="hidden" name="act" value="discover_models"><div class="grid"><div><label>供应商名称</label><input class="input" name="name" placeholder="例如：硅基流动/自建 NewAPI"></div><div><label>Base URL</label><input class="input" name="base_url" placeholder="https://api.xxx/v1"></div><div><label>API Key</label><input class="input" name="api_key" placeholder="sk-..."></div><div><label>排序</label><input class="input" name="sort_order" value="100"></div><div><label>读取超时秒</label><input class="input" name="timeout_seconds" value="20"></div></div><button class="btn btn2">通过 /v1/models 自动读取并批量导入</button></form>'''
     usage_html=''.join([f'<tr><td>{h(u["username"])}</td><td>{u["calls"]}</td><td>{u["total_tokens"]}</td><td>{h(u["last_at"])}</td></tr>' for u in usage]) or '<tr><td colspan="4">暂无调用日志</td></tr>'
     body=f'''<div class="card"><h2>管理后台</h2>{'<p class="ok">'+h(msg)+'</p>' if msg else ''}
@@ -653,41 +955,56 @@ def health():
 @app.route('/v1/models')
 def models():
     data=[]
-    for m in active_model_rows(): data.append({'id':m['display_name'] or m['model_id'],'object':'model','created':int(time.time()),'owned_by':m['name'],'provider_type':m['provider_type']})
+    for m in active_model_rows(): data.append({'id':m['display_name'] or m['model_id'],'object':'model','created':int(time.time()),'owned_by':m['name'],'provider_type':m['provider_type'],'endpoint_type':get_provider_endpoint_type(m),'capabilities':{'modalities':sorted(get_provider_modalities(m)),'stream':bool(m['supports_stream']),'tools':bool(m['supports_tools']),'max_input_tokens':m['max_input_tokens'],'max_output_tokens':m['max_output_tokens']}})
     return jsonify({'object':'list','data':data})
 
-@app.route('/v1/chat/completions',methods=['POST'])
-def chat_completions():
+def run_gateway_request(payload, target_api='chat_completions'):
     key,_=api_auth()
     if not key: return jsonify({'error':{'message':'Unauthorized: missing/invalid Bearer API key','type':'auth_error'}}),401
-    payload=request.get_json(force=True,silent=True) or {}; messages=payload.get('messages') or []
-    input_tokens=token_count(messages); today=dt.date.today().isoformat(); con=db()
-    if key['tokens_reset_date']!=today: con.execute('UPDATE users SET tokens_used_today=0,tokens_reset_date=? WHERE id=?',(today,key['user_id'])); con.commit(); used=0
-    else: used=key['tokens_used_today']
-    plan_limit=get_plan_config(True).get(key['plan'],PLAN_CONFIG['free'])['daily_tokens']; limits=[plan_limit]
-    if key['daily_token_limit']: limits.append(int(key['daily_token_limit']))
-    if key['quota_daily']: limits.append(int(key['quota_daily']))
-    if used+input_tokens>min(limits): return jsonify({'error':{'message':'Daily token quota exceeded','type':'quota_error'}}),429
-    candidates=candidate_model_rows(payload.get('model')); start=time.time()
-    if not candidates: return jsonify({'error':{'message':'No active model provider configured','type':'model_error'}}),502
+    messages=payload.get('messages') if 'messages' in payload else responses_input_to_chat_messages(payload.get('input',''))
+    input_tokens=token_count(messages)
+    quota_err=check_quota_and_reset(key,input_tokens)
+    if quota_err: return quota_err
+    start=time.time()
+    requested=payload.get('model')
+    raw_candidates=candidate_model_rows(requested)
+    if not raw_candidates: return jsonify({'error':{'message':'No active model provider configured','type':'model_error','code':'unsupported_model'}}),502
+    endpoint_types=None
+    if target_api=='messages': endpoint_types={'anthropic_messages'}
+    candidates=filter_candidates_by_capability(raw_candidates,payload,endpoint_types)
+    if not candidates:
+        return jsonify({'error':{'message':'No provider matches requested model/protocol/capabilities','type':'capability_error','code':'unsupported_modality','required_modalities':sorted(detect_modalities_from_payload(payload))}}),400
     # Streaming responses cannot be safely retried after bytes may have been sent to the client.
-    # For stream=true, use the first candidate only.
     if payload.get('stream'): candidates=candidates[:1]
     errors=[]
     for provider in candidates:
         try:
-            if provider['provider_type']=='openai': return proxy_openai(provider,payload,key,input_tokens,start)
-            return proxy_ollama(provider,payload,key,input_tokens,start)
+            return proxy_provider(provider,payload,key,input_tokens,start,target_api)
         except Exception as e:
-            errors.append({'provider':provider['name'],'model':provider['model_id'],'type':provider['provider_type'],'error':str(e)[:500]})
+            errors.append({'provider':provider['name'],'model':provider['model_id'],'type':provider['provider_type'],'endpoint_type':get_provider_endpoint_type(provider),'error':str(e)[:500]})
             continue
     provider=candidates[0]
-    if os.environ.get('DEMO_FALLBACK','0')=='1':
-        content='演示模式：平台网关、用户系统、API Key 鉴权、套餐限额都已正常工作；当前所有模型上游不可用，所以这里返回模拟回复。收到的问题：'+(messages[-1].get('content','') if messages else '')
-        out_tokens=max(1,len(content)//2); dur=int((time.time()-start)*1000); model_id=(provider['model_id'] if provider else MODEL_NAME)+'-demo'
-        con.execute('UPDATE users SET tokens_used_today=tokens_used_today+? WHERE id=?',(input_tokens+out_tokens,key['user_id'])); con.execute('INSERT INTO usage_logs(user_id,api_key_id,tokens_input,tokens_output,model,endpoint,duration_ms,ip_address) VALUES(?,?,?,?,?,?,?,?)',(key['user_id'],key['id'],input_tokens,out_tokens,model_id,'/v1/chat/completions',dur,request.remote_addr)); con.commit()
+    if os.environ.get('DEMO_FALLBACK','0')=='1' and target_api=='chat_completions':
+        content='演示模式：平台网关、用户系统、API Key 鉴权、套餐限额都已正常工作；当前所有模型上游不可用，所以这里返回模拟回复。收到的问题：'+content_text(messages[-1].get('content','') if messages else '')
+        out_tokens=max(1,len(content)//2); model_id=(provider['model_id'] if provider else MODEL_NAME)+'-demo'
+        record_usage(key,input_tokens,out_tokens,model_id,'/v1/chat/completions',start)
         return jsonify({'id':'chatcmpl-demo','object':'chat.completion','created':int(time.time()),'model':model_id,'choices':[{'index':0,'message':{'role':'assistant','content':content},'finish_reason':'stop'}],'usage':{'prompt_tokens':input_tokens,'completion_tokens':out_tokens,'total_tokens':input_tokens+out_tokens},'fallback_errors':errors})
-    return jsonify({'error':{'message':'All model providers failed','type':'gateway_error','fallback_errors':errors}}),502
+    return jsonify({'error':{'message':'All model providers failed','type':'gateway_error','code':'provider_error','fallback_errors':errors}}),502
+
+@app.route('/v1/chat/completions',methods=['POST'])
+def chat_completions():
+    payload=request.get_json(force=True,silent=True) or {}
+    return run_gateway_request(payload,'chat_completions')
+
+@app.route('/v1/responses',methods=['POST'])
+def responses_api():
+    payload=request.get_json(force=True,silent=True) or {}
+    return run_gateway_request(payload,'responses')
+
+@app.route('/v1/messages',methods=['POST'])
+def messages_api():
+    payload=request.get_json(force=True,silent=True) or {}
+    return run_gateway_request(payload,'messages')
 
 init_db()
 

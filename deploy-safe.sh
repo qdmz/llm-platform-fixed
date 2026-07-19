@@ -6,6 +6,9 @@ MODEL_NAME=${MODEL_NAME:-qwen2.5-coder-14b-ms:latest}
 PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-https://newapi.ypvps.com}
 ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin123}
 mkdir -p "$APP_DIR"/{gateway,data,logs}
+if [ -f "$APP_DIR/data/platform.db" ]; then
+  cp "$APP_DIR/data/platform.db" "$APP_DIR/data/platform.db.$(date +%F-%H%M%S).bak"
+fi
 python3 -m venv "$APP_DIR/venv"
 "$APP_DIR/venv/bin/pip" install -U pip wheel
 "$APP_DIR/venv/bin/pip" install -r /tmp/llm-platform-fixed/requirements.txt
