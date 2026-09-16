@@ -127,6 +127,10 @@ class KeyPathMiddleware:
     对客户端来说只是个普通的 base_url，无需自定义头支持。
     """
     PREFIX = '/k/'
+    # 缺少 /v1 前缀时自动补全。客户端（WorkBuddy / OpenAI SDK 等）会把 base 地址
+    # 规范成 ".../chat/completions"，所以 base 写 http://host/k/<key> 时路径会变成
+    # /k/<key>/chat/completions，需要在这里补回 /v1。
+    _V1_ENDPOINTS = ('chat/completions','completions','embeddings','models','responses','messages','moderations','images/','audio/')
 
     def __init__(self, wsgi_app):
         self.wsgi_app = wsgi_app
@@ -138,7 +142,14 @@ class KeyPathMiddleware:
             key, sep, tail = rest.partition('/')
             if key:
                 environ['HTTP_X_API_KEY'] = key
-                environ['PATH_INFO'] = ('/' + tail) if sep else '/'
+                if not sep or not tail:
+                    environ['PATH_INFO'] = '/k'
+                elif tail == 'v1' or tail.startswith('v1/'):
+                    environ['PATH_INFO'] = '/' + tail
+                elif any(tail.startswith(p) for p in self._V1_ENDPOINTS):
+                    environ['PATH_INFO'] = '/v1/' + tail
+                else:
+                    environ['PATH_INFO'] = '/' + tail
         return self.wsgi_app(environ, start_response)
 
 app.wsgi_app = KeyPathMiddleware(app.wsgi_app)
@@ -373,18 +384,26 @@ def seed_master_api_key(c):
     客户端（WorkBuddy、脚本、第三方 SDK）配置就不必跟着改。
     不设置该变量时本函数不做任何事。
     """
-    raw=(os.environ.get('MASTER_API_KEY') or os.environ.get('STATIC_API_KEY') or '').strip()
-    if not raw: return
+    raw_keys=[]
+    for env_name in ('MASTER_API_KEY','STATIC_API_KEY'):
+        v=(os.environ.get(env_name) or '').strip()
+        if v: raw_keys.append((v,env_name+' (env)'))
+    # EXTRA_API_KEYS=sk-a,sk-b —— 让后台手工创建的 Key 也能在重新部署后自动重建
+    for i,part in enumerate(re.split(r'[,\n;]+', os.environ.get('EXTRA_API_KEYS') or ''),1):
+        v=part.strip()
+        if v: raw_keys.append((v,'EXTRA_API_KEYS #%d (env)'%i))
+    if not raw_keys: return
     admin=c.execute('SELECT id FROM users WHERE is_admin=1 ORDER BY id ASC LIMIT 1').fetchone()
     if not admin: return
     uid=admin['id']
-    key_hash=hashlib.sha256(raw.encode()).hexdigest()
-    row=c.execute('SELECT id FROM api_keys WHERE key_hash=?',(key_hash,)).fetchone()
-    if row:
-        c.execute('UPDATE api_keys SET is_active=1,key_plain=?,user_id=? WHERE id=?',(raw,uid,row['id']))
-    else:
-        c.execute('INSERT INTO api_keys(user_id,key_hash,key_prefix,key_plain,name,rate_limit) VALUES(?,?,?,?,?,?)',(uid,key_hash,raw[:10],raw,'MASTER_API_KEY (env)',100000))
-    print('[init] MASTER_API_KEY seeded as an always-valid admin API key')
+    for raw,label in raw_keys:
+        key_hash=hashlib.sha256(raw.encode()).hexdigest()
+        row=c.execute('SELECT id FROM api_keys WHERE key_hash=?',(key_hash,)).fetchone()
+        if row:
+            c.execute('UPDATE api_keys SET is_active=1,key_plain=?,user_id=? WHERE id=?',(raw,uid,row['id']))
+        else:
+            c.execute('INSERT INTO api_keys(user_id,key_hash,key_prefix,key_plain,name,rate_limit) VALUES(?,?,?,?,?,?)',(uid,key_hash,raw[:10],raw,label,100000))
+    print('[init] %d env API key(s) seeded as always-valid admin keys' % len(raw_keys))
 
 def _upstream_env_present():
     if (os.environ.get('UPSTREAM_BASE_URL') or '').strip(): return True
@@ -1688,8 +1707,24 @@ def health():
     providers=[{'id':m['id'],'name':m['name'],'type':m['provider_type'],'model':m['model_id'],'active':bool(m['is_active']),'default':bool(m['is_default'])} for m in db().execute('SELECT * FROM model_providers ORDER BY is_default DESC,sort_order ASC,id ASC').fetchall()]
     return jsonify({'ok':True,'db':os.path.exists(DB_PATH),'ollama':ollama,'model':MODEL_NAME,'ollama_models':models,'model_providers':providers})
 
+@app.route('/k',methods=['GET','POST'])
+def key_path_helper():
+    """直接访问 /k/<key>（URL 里没带端点路径）时的提示。"""
+    info={'ok':True,
+        'why':'部分 CDN / 反代会丢弃 Authorization 头，把 API Key 放进 URL 路径即可绕过',
+        'base_url_examples':['https://<host>/k/<API_KEY>/v1','https://<host>/k/<API_KEY>'],
+        'endpoints':['/k/<API_KEY>/v1/chat/completions','/k/<API_KEY>/v1/models','/k/<API_KEY>/v1/responses','/k/<API_KEY>/v1/messages'],
+        'other_ways':['请求头 X-API-Key / api-key','查询串 ?api_key=<API_KEY>']}
+    if request.method=='POST':
+        info['ok']=False
+        info['hint']='请求路径缺少端点。请把 base_url 设为 https://<host>/k/<API_KEY>/v1（客户端会自动补 /chat/completions）'
+        return jsonify(info),400
+    return jsonify(info)
+
 @app.route('/v1/models')
 def models():
+    if (os.environ.get('MODELS_REQUIRE_AUTH') or '').strip().lower() in ('1','true','yes','on') and not api_auth()[0]:
+        return jsonify({'error':{'message':'Unauthorized: missing/invalid API key','type':'auth_error'}}),401
     data=[]
     for m in active_model_rows(): data.append({'id':m['display_name'] or m['model_id'],'object':'model','created':int(time.time()),'owned_by':m['name'],'provider_type':m['provider_type'],'endpoint_type':get_provider_endpoint_type(m),'capabilities':{'modalities':sorted(get_provider_modalities(m)),'stream':bool(m['supports_stream']),'tools':bool(m['supports_tools']),'max_input_tokens':m['max_input_tokens'],'max_output_tokens':m['max_output_tokens']}})
     resp=jsonify({'object':'list','data':data})
