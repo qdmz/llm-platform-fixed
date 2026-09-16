@@ -106,8 +106,13 @@ def page(body):
 def db():
     if not hasattr(g, 'db'):
         os.makedirs(DATA_DIR, exist_ok=True)
-        g.db = sqlite3.connect(DB_PATH)
+        g.db = sqlite3.connect(DB_PATH, timeout=20)
         g.db.row_factory = sqlite3.Row
+        try:
+            g.db.execute('PRAGMA busy_timeout=20000')
+            g.db.execute('PRAGMA journal_mode=WAL')
+        except sqlite3.Error:
+            pass
     return g.db
 
 @app.teardown_appcontext
@@ -117,8 +122,12 @@ def close_db(exc):
 
 def init_db():
     os.makedirs(DATA_DIR, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=30)
     con.row_factory = sqlite3.Row
+    try:
+        con.execute('PRAGMA busy_timeout=30000')
+    except sqlite3.Error:
+        pass
     c = con.cursor()
     c.executescript('''
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,plan TEXT DEFAULT 'free',plan_expires_at TEXT,tokens_used_today INTEGER DEFAULT 0,tokens_reset_date TEXT,balance REAL DEFAULT 0,invite_code TEXT UNIQUE,invited_by INTEGER,is_admin INTEGER DEFAULT 0,is_active INTEGER DEFAULT 1,created_at TEXT DEFAULT CURRENT_TIMESTAMP,last_login TEXT,daily_token_limit INTEGER,custom_rate_limit INTEGER);
@@ -191,28 +200,52 @@ def _upstream_env_present():
         if (os.environ.get('UPSTREAM_%d_BASE_URL'%i) or '').strip(): return True
     return False
 
+_SEED_STATE={'started':False,'lock':os.path.join(DATA_DIR,'.upstream-seed.lock')}
+
 def start_upstream_seed_thread():
     """在后台线程里播种上游模型，绝不阻塞启动。
 
     背景：UPSTREAM_n_FETCH_MODELS=1 时需要对每个上游发一次 HTTP 请求。
-    16 个上游串行、每个超时 15s 的话，最坏会拖住启动好几分钟，
-    PaaS 的健康检查等不到端口监听就直接判定部署失败（页面 502）。
+    16 个上游串行、每个超时十几秒的话，最坏会拖住启动好几分钟，
+    PaaS 的健康检查等不到端口监听就直接判定部署失败（外部 502）。
     所以这里把整个播种过程挪到 daemon 线程：端口先监听，模型慢慢导入。
+
+    幂等 + 跨进程互斥：wsgi.py / main.py 可能各调用一次 init_db()，
+    gunicorn 又可能起多个 worker，这里用进程内标志 + 锁文件保证
+    同一时间只有一个进程真正去拉上游，避免把上游打爆 / 把 SQLite 锁死。
     """
+    if _SEED_STATE['started']:
+        return
+    _SEED_STATE['started']=True
     if not _upstream_env_present():
         print('[init] no UPSTREAM_* env found, skip seeding')
         return
     def worker():
+        lock_path=_SEED_STATE['lock']
+        try:
+            if os.path.exists(lock_path) and time.time()-os.path.getmtime(lock_path)>600:
+                os.remove(lock_path)          # 陈旧锁（上次进程被强杀）自动清理
+            fd=os.open(lock_path, os.O_CREAT|os.O_EXCL|os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode()); os.close(fd)
+        except FileExistsError:
+            print('[init] another worker is already seeding upstream models, skip')
+            return
+        except Exception as e:
+            print('[init] seed lock unavailable (%s), proceeding anyway' % e)
         try:
             con=sqlite3.connect(DB_PATH, timeout=30)
             con.row_factory=sqlite3.Row
             try:
+                con.execute('PRAGMA busy_timeout=30000')
                 seed_upstream_from_env(con); con.commit()
                 print('[init] upstream seeding finished in background')
             finally:
                 con.close()
         except Exception as e:
             print('[init] upstream seeding failed (ignored):', e)
+        finally:
+            try: os.remove(lock_path)
+            except OSError: pass
     threading.Thread(target=worker, name='upstream-seed', daemon=True).start()
     print('[init] upstream seeding started in background thread')
 
@@ -848,18 +881,20 @@ def healthz():
     """轻量健康检查：不做任何外部网络请求，保证平台探针秒回 200。"""
     return jsonify({'ok': True, 'service': 'llm-platform'})
 
-_OLLAMA_PROBE={'at':0.0,'ok':None}
+_OLLAMA_PROBE={'ok':None}
+def _ollama_probe_loop():
+    """后台低频探测本地 Ollama，请求路径里永远不做这个网络请求。"""
+    while True:
+        try:
+            _OLLAMA_PROBE['ok']=bool(requests.get(f'{OLLAMA_BASE_URL}/api/tags',timeout=5).ok)
+        except Exception:
+            _OLLAMA_PROBE['ok']=False
+        time.sleep(60)
+threading.Thread(target=_ollama_probe_loop,name='ollama-probe',daemon=True).start()
+
 def ollama_status_html():
-    """探测本地 Ollama 状态，结果缓存 60s —— 首页/健康探针不能被 1.5s 超时拖慢。"""
-    global _OLLAMA_PROBE
-    now=time.time()
-    if _OLLAMA_PROBE['ok'] is not None and now-_OLLAMA_PROBE['at']<60:
-        return '<span class="ok">已连接</span>' if _OLLAMA_PROBE['ok'] else '<span class="bad">未连接</span>'
-    try:
-        r=requests.get(f'{OLLAMA_BASE_URL}/api/tags',timeout=1.2); ok=bool(r.ok)
-    except Exception:
-        ok=False
-    _OLLAMA_PROBE={'at':now,'ok':ok}
+    ok=_OLLAMA_PROBE['ok']
+    if ok is None: return '<span class="muted">探测中</span>'
     return '<span class="ok">已连接</span>' if ok else '<span class="bad">未连接</span>'
 
 @app.route('/')

@@ -105,8 +105,13 @@ else
 fi
 
 if command -v gunicorn >/dev/null 2>&1; then
+  # 单进程 + 多线程：SQLite 对多进程写入很不友好（database is locked），
+  # 而且每个 worker 都会重新初始化数据库 / 重新拉取上游模型列表。
+  # 要恢复多进程请自行设置 GUNICORN_WORKERS，并确保上游数量少。
   exec gunicorn \
-    --workers "${GUNICORN_WORKERS:-2}" \
+    --workers "${GUNICORN_WORKERS:-1}" \
+    --worker-class "${GUNICORN_WORKER_CLASS:-gthread}" \
+    --threads "${GUNICORN_THREADS:-8}" \
     --timeout "${GUNICORN_TIMEOUT:-300}" \
     --bind "0.0.0.0:${PORT}" \
     --access-logfile - \
