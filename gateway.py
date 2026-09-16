@@ -824,7 +824,7 @@ def index():
         model_card=f'<div class="card"><h3>平台可用模型</h3><ul>{platform_models}</ul><p class="muted">接口地址 <b>{h(public_base)}/v1</b>；完整接入示例见 <a href="/dashboard">用户控制台</a>。</p></div>'
         api_card=f'<div class="card"><h3>OpenAI 兼容接口</h3><pre>curl {h(public_base)}/v1/models\nPOST {h(public_base)}/v1/chat/completions</pre></div>' if u['is_admin'] else ''
         admin_debug=api_card+model_card
-    body=f'<div class="grid"><div class="card"><h3>平台状态</h3><p>Web 网关：<span class="ok">运行中</span></p><p>默认模型：<b>{h((am[0]["model_id"] if am else MODEL_NAME))}</b></p><p class="muted">OpenAI 兼容接口：<b>{h(public_base)}/v1</b> · 登录后可创建 API Key 并在 <a href="/playground">聊天测试</a> 页验证。</p></div>{admin_debug}</div><h2>套餐</h2><div class="grid">{cards}</div><h2>管理项目</h2><div class="grid">{project_html}</div>'
+    body=f'<div class="grid"><div class="card"><h3>平台状态</h3><p>Web 网关：<span class="ok">运行中</span></p><p>默认模型：<b>{h((am[0]["model_id"] if am else MODEL_NAME))}</b></p><p>可用模型：<b>{len(am)}</b> 个</p><p class="muted">OpenAI 兼容接口：<b>{h(public_base)}/v1</b> · 登录后可创建 API Key 并在 <a href="/playground">聊天测试</a> 页验证。</p></div>{admin_debug}</div><h2>套餐</h2><div class="grid">{cards}</div><h2>管理项目</h2><div class="grid">{project_html}</div>'
     return page(body)
 
 @app.route('/login',methods=['GET','POST'])
@@ -1144,7 +1144,7 @@ def admin():
         elif act=='ticket_reply':
             tid=request.form.get('ticket_id'); reply=request.form.get('reply','').strip(); status=request.form.get('status','pending')
             if reply: con.execute('INSERT INTO ticket_messages(ticket_id,user_id,author_role,message) VALUES(?,?,?,?)',(tid,current_user()['id'],'admin',reply))
-            con.execute('UPDATE tickets SET title=COALESCE(NULLIF(?,''),title),category=?,priority=?,status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',(request.form.get('title',''),request.form.get('category','general'),request.form.get('priority','normal'),status,tid)); con.commit(); msg='工单已回复/更新'
+            con.execute("UPDATE tickets SET title=COALESCE(NULLIF(?,''),title),category=?,priority=?,status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",(request.form.get('title',''),request.form.get('category','general'),request.form.get('priority','normal'),status,tid)); con.commit(); msg='工单已回复/更新'
         elif act=='delete_ticket':
             tid=request.form.get('ticket_id'); con.execute('DELETE FROM ticket_messages WHERE ticket_id=?',(tid,)); con.execute('DELETE FROM tickets WHERE id=?',(tid,)); con.commit(); msg='工单已删除'
         elif act=='clear_usage_logs':
