@@ -6,6 +6,7 @@ import hashlib
 import secrets
 import sqlite3
 import datetime as dt
+import threading
 from functools import wraps
 from urllib.parse import urlencode
 from html import escape
@@ -157,10 +158,10 @@ CREATE TABLE IF NOT EXISTS email_activations(id INTEGER PRIMARY KEY AUTOINCREMEN
     c.execute('DELETE FROM model_providers WHERE id NOT IN (SELECT MIN(id) FROM model_providers GROUP BY provider_type, model_id, base_url)')
     if not c.execute('SELECT 1 FROM model_providers WHERE provider_type=? AND model_id=? AND base_url=?',('ollama',MODEL_NAME,OLLAMA_BASE_URL)).fetchone():
         c.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order) VALUES(?,?,?,?,?,?,?,?,?)', ('本地 Ollama','ollama',OLLAMA_BASE_URL,'',MODEL_NAME,MODEL_NAME,1,1,10))
-    seed_upstream_from_env(c)
     c.execute('INSERT OR IGNORE INTO users(username,email,password_hash,is_admin,invite_code,tokens_reset_date) VALUES(?,?,?,?,?,?)', ('admin','admin@example.com',generate_password_hash(ADMIN_PASSWORD),1,secrets.token_hex(6).upper(),dt.date.today().isoformat()))
     seed_master_api_key(c)
     con.commit(); con.close()
+    start_upstream_seed_thread()
 
 def seed_master_api_key(c):
     """把 MASTER_API_KEY 环境变量播种成一把"永远有效"的 API Key（归属 admin）。
@@ -182,6 +183,38 @@ def seed_master_api_key(c):
     else:
         c.execute('INSERT INTO api_keys(user_id,key_hash,key_prefix,key_plain,name,rate_limit) VALUES(?,?,?,?,?,?)',(uid,key_hash,raw[:10],raw,'MASTER_API_KEY (env)',100000))
     print('[init] MASTER_API_KEY seeded as an always-valid admin API key')
+
+def _upstream_env_present():
+    if (os.environ.get('UPSTREAM_BASE_URL') or '').strip(): return True
+    if (os.environ.get('OPENAI_BASE_URL') or '').strip(): return True
+    for i in range(1,51):
+        if (os.environ.get('UPSTREAM_%d_BASE_URL'%i) or '').strip(): return True
+    return False
+
+def start_upstream_seed_thread():
+    """在后台线程里播种上游模型，绝不阻塞启动。
+
+    背景：UPSTREAM_n_FETCH_MODELS=1 时需要对每个上游发一次 HTTP 请求。
+    16 个上游串行、每个超时 15s 的话，最坏会拖住启动好几分钟，
+    PaaS 的健康检查等不到端口监听就直接判定部署失败（页面 502）。
+    所以这里把整个播种过程挪到 daemon 线程：端口先监听，模型慢慢导入。
+    """
+    if not _upstream_env_present():
+        print('[init] no UPSTREAM_* env found, skip seeding')
+        return
+    def worker():
+        try:
+            con=sqlite3.connect(DB_PATH, timeout=30)
+            con.row_factory=sqlite3.Row
+            try:
+                seed_upstream_from_env(con); con.commit()
+                print('[init] upstream seeding finished in background')
+            finally:
+                con.close()
+        except Exception as e:
+            print('[init] upstream seeding failed (ignored):', e)
+    threading.Thread(target=worker, name='upstream-seed', daemon=True).start()
+    print('[init] upstream seeding started in background thread')
 
 def seed_upstream_from_env(c):
     """按环境变量预置第三方上游模型。
@@ -226,7 +259,7 @@ def seed_upstream_from_env(c):
         models=[m.strip() for m in raw.split(',') if m.strip()] or [MODEL_NAME]
         if g['fetch'].strip().lower() in ('1','true','yes','on'):
             try:
-                r=requests.get(base+'/models', headers=({'Authorization':'Bearer '+key} if key else {}), timeout=15)
+                r=requests.get(base+'/models', headers=({'Authorization':'Bearer '+key} if key else {}), timeout=6)
                 ids=[m.get('id') for m in r.json().get('data',[]) if m.get('id')]
                 if ids:
                     models=ids[:max(1,int(os.environ.get('UPSTREAM_FETCH_MODELS_MAX','500')))]
@@ -810,11 +843,28 @@ def proxy_ollama(provider, payload, key, input_tokens, start):
     con.commit()
     return jsonify({'id':'chatcmpl-local','object':'chat.completion','created':int(time.time()),'model':model,'choices':[{'index':0,'message':{'role':'assistant','content':content},'finish_reason':'stop'}],'usage':{'prompt_tokens':input_tokens,'completion_tokens':out_tokens,'total_tokens':input_tokens+out_tokens}})
 
+@app.route('/healthz')
+def healthz():
+    """轻量健康检查：不做任何外部网络请求，保证平台探针秒回 200。"""
+    return jsonify({'ok': True, 'service': 'llm-platform'})
+
+_OLLAMA_PROBE={'at':0.0,'ok':None}
+def ollama_status_html():
+    """探测本地 Ollama 状态，结果缓存 60s —— 首页/健康探针不能被 1.5s 超时拖慢。"""
+    global _OLLAMA_PROBE
+    now=time.time()
+    if _OLLAMA_PROBE['ok'] is not None and now-_OLLAMA_PROBE['at']<60:
+        return '<span class="ok">已连接</span>' if _OLLAMA_PROBE['ok'] else '<span class="bad">未连接</span>'
+    try:
+        r=requests.get(f'{OLLAMA_BASE_URL}/api/tags',timeout=1.2); ok=bool(r.ok)
+    except Exception:
+        ok=False
+    _OLLAMA_PROBE={'at':now,'ok':ok}
+    return '<span class="ok">已连接</span>' if ok else '<span class="bad">未连接</span>'
+
 @app.route('/')
 def index():
-    try:
-        r=requests.get(f'{OLLAMA_BASE_URL}/api/tags',timeout=1.5); ollama='<span class="ok">已连接</span>' if r.ok else '<span class="bad">异常</span>'
-    except Exception: ollama='<span class="bad">未连接</span>'
+    ollama=ollama_status_html()
     public_base=public_base_url(); plans=get_plan_config(); projects=db().execute('SELECT * FROM managed_projects ORDER BY sort_order ASC,id DESC LIMIT 12').fetchall()
     cards=''.join([f'<div class="card"><span class="pill">{h(pid)}</span><h3>{h(v["name"])}</h3><div class="price">¥{v["price"]:g}</div><p class="muted">每日 {v["daily_tokens"]:,} tokens · 限速 {v["rate_limit"]}/分钟 · {v["days"]}天</p><p class="muted">{h(v.get("description",""))}</p><a class="btn" href="/dashboard">购买/使用</a></div>' for pid,v in plans.items()])
     project_html=''.join([f'<div class="card"><span class="pill">{h(x["status"])}</span><h3>{h(x["name"])}</h3><p class="muted">{h(x["description"])}</p>'+(f'<a class="btn btn2" href="{h(x["base_url"])}">打开项目</a>' if x['base_url'] else '')+'</div>' for x in projects]) or '<div class="card">暂无项目</div>'
