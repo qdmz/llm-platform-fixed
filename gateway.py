@@ -1999,10 +1999,24 @@ def run_gateway_request(payload, target_api='chat_completions'):
     # Streaming responses cannot be safely retried after bytes may have been sent to the client.
     if payload.get('stream'): candidates=candidates[:1]
     errors=[]
+    _req=(requested or '').strip().lower()
+    auto_mode=(not _req) or _req in ('auto','auto:fallback','fallback')
     for provider in candidates:
         t_try=time.time()
         try:
             resp=proxy_provider(provider,payload,key,input_tokens,start,target_api)
+            # auto 模式下"200 但内容是空的"也算失败：换下一个候选，并让该模型被降权
+            if auto_mode and not payload.get('stream'):
+                try:
+                    _data=json.loads(resp.get_data().decode('utf-8'))
+                    _ch=(_data.get('choices') or [{}])[0] or {}
+                    _msg=_ch.get('message') or {}
+                    if not (_msg.get('content') or '').strip() and not _msg.get('tool_calls'):
+                        record_model_result(provider['id'],False,round((time.time()-t_try)*1000),'empty completion')
+                        errors.append({'provider':provider['name'],'model':provider['model_id'],'error':'empty completion (auto retry)'})
+                        continue
+                except Exception:
+                    pass
             record_model_result(provider['id'],True,round((time.time()-t_try)*1000))
             return resp
         except Exception as e:
