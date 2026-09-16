@@ -85,8 +85,32 @@ curl https://<你的域名>/v1/models
 
 ## 注意事项
 
-* 沙箱的文件系统通常是**临时的**：重新部署会清空 `runtime/platform.db`。
-  如需保留用户/API Key/订单，请挂载持久卷到 `LLM_PLATFORM_HOME`。
+### 数据持久化（重要）
+
+PandaStack App Hosting（及大多数沙箱 PaaS）**目前不支持给 App 挂载持久卷**，
+文件系统是临时的：每次重新部署都会清空 `runtime/platform.db`（用户 / API Key / 订单全部丢失）。
+运行期间不会丢，只有重新部署才丢。
+
+本仓库已内置 **Litestream 方案**：启动时自动下载 litestream，
+把 SQLite 实时复制到任意 S3 兼容对象存储（推荐 Cloudflare R2，免费 10GB），
+下次启动自动从副本恢复，数据跨重新部署保留。
+
+在平台环境变量里增加（建议勾选 secret）：
+
+| 变量 | 说明 |
+| --- | --- |
+| `LITESTREAM_ENDPOINT` | R2 为 `https://<账户ID>.r2.cloudflarestorage.com` |
+| `LITESTREAM_BUCKET` | 桶名 |
+| `LITESTREAM_ACCESS_KEY_ID` | R2 API Token 的 Access Key ID |
+| `LITESTREAM_SECRET_ACCESS_KEY` | R2 API Token 的 Secret Access Key |
+| `LITESTREAM_REGION` | 可选，R2 用 `auto`（默认） |
+| `LITESTREAM_REPLICA_PATH` | 可选，桶内对象路径，默认 `llm-platform/platform.db` |
+
+不设置这些变量时完全走本地 SQLite（现状，重新部署丢数据）。
+R2 操作：Dashboard → R2 → Create bucket → API Tokens（Object Read & Write）。
+
+### 其它
+
 * 沙箱内没有本地 Ollama，`/health` 的 `ollama` 会是 `false`。
   请在 `/admin` 里配置一个 OpenAI 兼容的第三方上游，或设 `DEMO_FALLBACK=1` 先跑通流程。
 * 建议把 `ADMIN_PASSWORD`、`FLASK_SECRET_KEY`、`PUBLIC_BASE_URL` 放在平台的环境变量里，
