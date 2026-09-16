@@ -25,6 +25,9 @@ DB_PATH = os.path.join(DATA_DIR, 'platform.db')
 MODEL_NAME = os.environ.get('MODEL_NAME', 'qwen2.5-coder-14b-ms:latest')
 OLLAMA_BASE_URL = os.environ.get('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
+ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
+ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@ypvps.com')
+SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 EPAY_API_URL = os.environ.get('EPAY_API_URL', '').rstrip('/')
 EPAY_PID = os.environ.get('EPAY_PID', '')
@@ -34,11 +37,78 @@ PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', f'https://{DOMAIN}')
 
 PLAN_CONFIG = {
     'free': {'name': '免费版', 'price': 0, 'daily_tokens': 10000, 'rate_limit': 20, 'days': 3650, 'description': '免费体验'},
-    'starter': {'name': '入门版', 'price': 29, 'daily_tokens': 200000, 'rate_limit': 60, 'days': 30, 'description': '个人轻量调用'},
-    'pro': {'name': '专业版', 'price': 99, 'daily_tokens': 1000000, 'rate_limit': 180, 'days': 30, 'description': '生产项目推荐'},
-    'enterprise': {'name': '企业版', 'price': 399, 'daily_tokens': 5000000, 'rate_limit': 600, 'days': 30, 'description': '团队与高并发'},
-    'yearly': {'name': '年付专业版', 'price': 999, 'daily_tokens': 1500000, 'rate_limit': 240, 'days': 365, 'description': '年付优惠'},
+    'starter': {'name': '入门版', 'price': 1, 'daily_tokens': 200000, 'rate_limit': 60, 'days': 30, 'description': '个人轻量调用'},
+    'pro': {'name': '专业版', 'price': 2, 'daily_tokens': 1000000, 'rate_limit': 180, 'days': 30, 'description': '生产项目推荐'},
+    'enterprise': {'name': '企业版', 'price': 3, 'daily_tokens': 5000000, 'rate_limit': 600, 'days': 30, 'description': '团队与高并发'},
+    'yearly': {'name': '年付专业版', 'price': 9, 'daily_tokens': 1500000, 'rate_limit': 240, 'days': 365, 'description': '年付优惠'},
 }
+
+# 套餐默认值可以用环境变量覆盖（容器盘是临时的，每次重新部署都要重建数据库，
+# 写在环境变量里就不必每次进后台手工改价格）。
+#
+#   PLAN_<ID>_<字段>         例：PLAN_FREE_PRICE=0  PLAN_STARTER_PRICE=1  PLAN_PRO_PRICE=2
+#   PLAN_<编号>_<字段>       例：PLAN_1_ID=free  PLAN_1_NAME=免费版  PLAN_1_PRICE=0
+#
+# 可用字段后缀：ID / NAME / PRICE / TOKENS（每日额度）/ RATE（每分钟次数）/ DAYS / DESC
+PLAN_ENV_KEYS = {
+    'NAME': 'name', 'PRICE': 'price', 'TOKENS': 'daily_tokens', 'DAILY_TOKENS': 'daily_tokens',
+    'RATE': 'rate_limit', 'RATE_LIMIT': 'rate_limit', 'DAYS': 'days',
+    'DESC': 'description', 'DESCRIPTION': 'description',
+}
+
+def _plan_env_suffixes():
+    out = {}
+    for suffix, key in PLAN_ENV_KEYS.items():
+        out.setdefault(key, []).append(suffix)
+    return out
+
+def _plan_cast(key, raw):
+    raw = (raw or '').strip()
+    if raw == '':
+        return None
+    if key in ('price',):
+        try: return float(raw)
+        except ValueError: return None
+    if key in ('daily_tokens', 'rate_limit', 'days'):
+        try: return int(float(raw))
+        except ValueError: return None
+    return raw
+
+def plan_env_overrides():
+    """只收集环境变量里**显式写了**的套餐字段：{plan_id: {列名: 值}}。"""
+    ov = {}
+    # 1) 按套餐 id：PLAN_FREE_PRICE / PLAN_PRO_NAME ...
+    for pid in PLAN_CONFIG:
+        prefix = 'PLAN_%s_' % re.sub(r'[^A-Za-z0-9]', '_', pid).upper()
+        for key, suffixes in _plan_env_suffixes().items():
+            for sfx in suffixes:
+                val = _plan_cast(key, os.environ.get(prefix + sfx))
+                if val is not None:
+                    ov.setdefault(pid, {})[key] = val
+                    break
+    # 2) 按编号：PLAN_1_ID/NAME/PRICE/...（可定义全新套餐）
+    for i in range(1, 21):
+        pid = (os.environ.get('PLAN_%d_ID' % i) or '').strip()
+        if not pid or not re.match(r'^[a-zA-Z0-9_-]{2,32}$', pid):
+            continue
+        item = ov.setdefault(pid, {})
+        for key, suffixes in _plan_env_suffixes().items():
+            for sfx in suffixes:
+                val = _plan_cast(key, os.environ.get('PLAN_%d_%s' % (i, sfx)))
+                if val is not None:
+                    item[key] = val
+                    break
+    return ov
+
+def plan_config_from_env():
+    """内置套餐默认值 + 环境变量覆盖后的完整套餐表（用于首页/下单/播种）。"""
+    plans = {pid: dict(cfg) for pid, cfg in PLAN_CONFIG.items()}
+    for pid, fields in plan_env_overrides().items():
+        cfg = plans.get(pid) or {'name': pid, 'price': 0, 'daily_tokens': 0, 'rate_limit': 60, 'days': 30, 'description': ''}
+        cfg = dict(cfg)
+        cfg.update(fields)
+        plans[pid] = cfg
+    return plans
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -82,9 +152,115 @@ def no_cache_dynamic_pages(resp):
     return resp
 
 HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>商业化 LLM 平台</title><style>
-body{margin:0;background:#f6f7fb;color:#1f2937;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"PingFang SC",sans-serif}.wrap{max-width:1280px;margin:0 auto;padding:28px}.hero{background:linear-gradient(135deg,#111827,#2563eb);color:white;border-radius:22px;padding:34px;box-shadow:0 16px 45px #1d4ed833}.hero h1{margin:0 0 10px;font-size:32px}.hero p{opacity:.9}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px;margin-top:18px}.card{background:white;border-radius:18px;padding:20px;box-shadow:0 8px 30px #11182714;margin-top:16px}.muted{color:#6b7280}.pill{display:inline-block;padding:4px 10px;border-radius:999px;background:#e0f2fe;color:#0369a1;font-size:12px}.ok{color:#059669}.bad{color:#dc2626}.btn{display:inline-block;border:0;border-radius:10px;background:#2563eb;color:white;padding:10px 14px;text-decoration:none;cursor:pointer}.btn2{background:#111827}.btn-danger{background:#dc2626}.input{width:100%;box-sizing:border-box;border:1px solid #d1d5db;border-radius:10px;padding:10px;margin:6px 0 10px}pre{background:#0b1020;color:#d1e7ff;border-radius:14px;padding:14px;overflow:auto}table{border-collapse:collapse}td,th{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;vertical-align:top}th{background:#f9fafb}.mini{width:120px}.price{font-size:30px;font-weight:800}.nav a{color:white;margin-right:16px}.two{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}.playground{grid-template-columns:minmax(0,1.2fr) minmax(360px,.8fr)}.chat-toolbar{display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:10px;align-items:end}.chat-prompt{min-height:120px;max-height:220px;resize:vertical;margin-top:10px}.chat-result{min-height:220px;max-height:520px}.result-card{background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:10px}.result-meta{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 12px}.result-meta span{background:#eef2ff;color:#3730a3;border-radius:999px;padding:4px 9px;font-size:12px}.assistant-answer{white-space:pre-wrap;line-height:1.7;font-size:15px;background:white;border:1px solid #e5e7eb;border-radius:12px;padding:14px;color:#111827}.raw-json summary{cursor:pointer;color:#2563eb;margin-top:12px}.raw-json pre{max-height:360px}.curl-box{max-height:260px}.key-line{word-break:break-all}@media(max-width:900px){.two,.playground{grid-template-columns:1fr}.chat-toolbar{grid-template-columns:1fr}}
-</style></head><body><div class="wrap"><section class="hero"><h1>企业级商业化 LLM 平台</h1><p>OpenAI 兼容 API · 用户/套餐/API Key/订单/工单/发票 · 易支付 · Ollama/第三方模型中转</p>{{nav|safe}}</section>{{body|safe}}</div></body></html>'''
+<title>{{site_name}} · OpenAI 兼容大模型网关</title><style>
+:root{--bg:#f4f5f9;--card:#fff;--line:#e9ebf2;--text:#1f2329;--muted:#8b93a5;--primary:#5b5bd6;--primary2:#8257e6;--ok:#12b76a;--bad:#f04438;--warn:#f79009;--radius:14px}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.65;-webkit-font-smoothing:antialiased}
+a{color:var(--primary);text-decoration:none}a:hover{opacity:.85}
+h1,h2,h3,h4{margin:0 0 12px;line-height:1.3}h1{font-size:30px}h2{font-size:21px}h3{font-size:16px}h4{font-size:14px}
+p{margin:0 0 10px}
+/* top nav */
+.topbar{position:sticky;top:0;z-index:50;background:rgba(255,255,255,.9);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.topbar-inner{max-width:1240px;margin:0 auto;padding:0 20px;height:62px;display:flex;align-items:center;gap:18px}
+.brand{display:flex;align-items:center;gap:10px;color:var(--text);font-weight:700;flex:none}
+.brand-logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--primary),var(--primary2));color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;letter-spacing:.5px;box-shadow:0 4px 12px rgba(91,91,214,.35)}
+.brand-text{display:flex;flex-direction:column;line-height:1.1}
+.brand-text small{color:var(--muted);font-weight:400;font-size:11px}
+.menu{display:flex;align-items:center;gap:2px;flex:1;flex-wrap:wrap}
+.menu a{color:#4b5563;padding:7px 12px;border-radius:9px;font-size:13.5px}
+.menu a:hover{background:#f1f2f8;color:var(--text);opacity:1}
+.user-chip{display:flex;align-items:center;gap:10px;font-size:13px;flex:none}
+.avatar{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,var(--primary2),var(--primary));color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700}
+.user-chip a{color:var(--muted)}
+/* layout */
+.wrap{max-width:1240px;margin:0 auto;padding:22px 20px 8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
+.two{display:grid;grid-template-columns:1.05fr .95fr;gap:16px;align-items:start}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px;box-shadow:0 1px 2px rgba(16,24,40,.04);margin-bottom:16px}
+.card>h3:first-child,.card>h2:first-child{margin-top:0}
+.muted{color:var(--muted)}
+.ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}
+/* hero */
+.hero{position:relative;overflow:hidden;background:linear-gradient(135deg,#4f46e5 0%,#6d5ce7 45%,#8b5cf6 100%);color:#fff;border-radius:20px;padding:40px 36px 32px;box-shadow:0 18px 40px rgba(79,70,229,.28);margin-bottom:20px}
+.hero:after{content:"";position:absolute;right:-90px;top:-120px;width:340px;height:340px;border-radius:50%;background:rgba(255,255,255,.14)}
+.hero:before{content:"";position:absolute;right:70px;bottom:-150px;width:240px;height:240px;border-radius:50%;background:rgba(255,255,255,.1)}
+.hero h1{font-size:32px;margin-bottom:10px;position:relative;z-index:1}
+.hero p{opacity:.92;max-width:720px;position:relative;z-index:1}
+.hero-tag{display:inline-block;background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.28);border-radius:999px;padding:4px 12px;font-size:12px;margin-bottom:14px;position:relative;z-index:1}
+.hero-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;position:relative;z-index:1}
+.hero-stats{display:flex;gap:28px;flex-wrap:wrap;margin-top:26px;position:relative;z-index:1}
+.hero-stats div{display:flex;flex-direction:column}
+.hero-stats b{font-size:23px;font-weight:800}
+.hero-stats span{opacity:.85;font-size:12.5px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;border-radius:10px;background:var(--primary);color:#fff;padding:9px 16px;text-decoration:none;cursor:pointer;font-size:13.5px;font-weight:500;transition:.15s}
+.btn:hover{filter:brightness(1.06)}
+.btn-light{background:#fff;color:#4f46e5;font-weight:600}
+.btn-ghost{background:rgba(255,255,255,.14);color:#fff;border:1px solid rgba(255,255,255,.4)}
+.btn2{background:#fff;color:#4b5563;border:1px solid var(--line)}
+.btn2:hover{border-color:#c9cbd8;background:#fafbff}
+.btn-danger{background:#fff;color:var(--bad);border:1px solid #ffd7d3}
+.btn-danger:hover{background:#fff5f4}
+.btn-sm{padding:6px 12px;font-size:13px}
+.input{width:100%;border:1px solid var(--line);border-radius:10px;padding:9px 11px;margin:6px 0 10px;font-size:13.5px;background:#fff;color:var(--text);transition:.15s}
+.input:focus{outline:0;border-color:#b9b6f0;box-shadow:0 0 0 3px rgba(91,91,214,.12)}
+.mini{width:130px}
+select.input{cursor:pointer}
+label{font-size:13px;color:#4b5563;font-weight:500}
+/* tables */
+table{width:100%;border-collapse:separate;border-spacing:0;background:#fff}
+th{background:#fafbfd;color:var(--muted);font-size:12px;font-weight:600;text-transform:none;letter-spacing:.02em;padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+td{padding:11px 12px;border-bottom:1px solid #f2f3f8;text-align:left;vertical-align:top}
+tr:last-child td{border-bottom:0}
+.card table{margin-top:4px}
+/* tags */
+.pill{display:inline-block;padding:3px 9px;border-radius:999px;background:#eef0ff;color:#4f46e5;font-size:12px;font-weight:500}
+.pill-green{background:#e8f8ef;color:#0d9f5f}
+.pill-gray{background:#f2f3f8;color:#6b7280}
+.price{font-size:30px;font-weight:800;color:#1f2329;letter-spacing:-.5px}
+.price small{font-size:15px;font-weight:600;color:var(--muted);margin-right:2px}
+.plan-card{position:relative;display:flex;flex-direction:column}
+.plan-card.featured{border-color:#c7c4f5;box-shadow:0 10px 26px rgba(91,91,214,.13)}
+.plan-card ul{list-style:none;padding:0;margin:12px 0 16px}
+.plan-card li{padding:5px 0;color:#4b5563;font-size:13.5px}
+.plan-card li:before{content:"✓";color:var(--ok);font-weight:700;margin-right:8px}
+.stat-card{display:flex;flex-direction:column;gap:2px}
+.stat-card b{font-size:22px;font-weight:800}
+.section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:26px 0 12px}
+.section-head h2{margin:0}
+/* code */
+pre{background:#0f1222;color:#d7e3ff;border-radius:12px;padding:14px 16px;overflow:auto;font-size:12.5px;line-height:1.7;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+code{background:#f2f3f8;border-radius:6px;padding:1px 6px;font-size:12.5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre code{background:none;padding:0}
+.key-line{word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+.curl-box{max-height:280px}
+/* playground */
+.playground{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(360px,.85fr);gap:16px;align-items:start}
+.chat-toolbar{display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:10px;align-items:end}
+.chat-prompt{min-height:130px;max-height:240px;resize:vertical;margin-top:10px;width:100%;border:1px solid var(--line);border-radius:10px;padding:10px;font-family:inherit}
+.chat-result{min-height:220px;max-height:520px}
+.result-card{background:#fafbff;border:1px solid var(--line);border-radius:12px;padding:14px;margin-top:10px}
+.result-meta{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 12px}
+.result-meta span{background:#eef0ff;color:#4f46e5;border-radius:999px;padding:3px 9px;font-size:12px}
+.assistant-answer{white-space:pre-wrap;line-height:1.75;font-size:14.5px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;color:#1f2329}
+.raw-json summary{cursor:pointer;color:var(--primary);margin-top:12px}
+.raw-json pre{max-height:360px}
+/* misc */
+.inline-form{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0}
+.inline-form .input{width:auto;margin:0}
+.model-search{max-width:320px}
+.foot{max-width:1240px;margin:20px auto 40px;padding:18px 20px 0;border-top:1px solid var(--line);color:var(--muted);font-size:12.5px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.copy-box{background:#fafbff;border:1px dashed #d8dae8;border-radius:10px;padding:10px 12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;word-break:break-all}
+/* auth */
+.auth{max-width:440px;margin:34px auto 10px}
+.auth-head{text-align:center;margin-bottom:16px}
+.auth-head h2{font-size:23px;margin-bottom:6px}
+.auth-head p{color:var(--muted);font-size:13.5px}
+.auth-card{background:#fff;border:1px solid var(--line);border-radius:18px;padding:26px 24px;box-shadow:0 12px 32px rgba(16,24,40,.07)}
+.auth-switch{text-align:center;margin-top:14px;color:var(--muted);font-size:13.5px}
+.auth-card .btn{width:100%;padding:11px 16px;font-size:14px}
+@media(max-width:900px){.two,.playground,.chat-toolbar{grid-template-columns:1fr}.hero{padding:28px 22px}.hero h1{font-size:25px}.menu{gap:0}.brand-text small{display:none}}
+</style></head><body>{{nav|safe}}<main class="wrap">{{body|safe}}</main><footer class="foot"><span>{{site_name}} · OpenAI 兼容大模型网关</span><span>Chat Completions / Responses / Anthropic Messages</span></footer></body></html>'''
 
 def h(v):
     return escape('' if v is None else str(v), quote=True)
@@ -96,12 +272,19 @@ def has_request_context_safe():
 
 def page(body):
     u=current_user() if has_request_context_safe() else None
+    brand=('<a class="brand" href="/"><span class="brand-logo">LLM</span>'
+           f'<span class="brand-text">{h(SITE_NAME)}<small>OpenAI 兼容大模型网关</small></span></a>')
     if u:
-        admin_links='<a href="/admin">管理后台</a><a href="/v1/models">/v1/models</a><a href="/health">健康检查</a>' if u['is_admin'] else ''
-        nav=f'<div class="nav"><a href="/">首页</a><a href="/dashboard">用户控制台</a><a href="/playground">聊天测试</a>{admin_links}<a href="/logout">退出（{h(u["username"])}）</a></div>'
+        admin_links='<a href="/admin">管理后台</a>' if u['is_admin'] else ''
+        menu=(f'<nav class="menu"><a href="/">首页</a><a href="/dashboard">用户控制台</a><a href="/playground">聊天测试</a>'
+              f'{admin_links}<a href="/v1/models">模型列表</a><a href="/health">服务状态</a></nav>')
+        chip=(f'<div class="user-chip"><span class="avatar">{h((u["username"] or "U")[:1].upper())}</span>'
+              f'<b>{h(u["username"])}</b><a href="/logout">退出</a></div>')
     else:
-        nav='<div class="nav"><a href="/">首页</a><a href="/login">登录</a><a href="/register">注册</a></div>'
-    return render_template_string(HTML, body=body, nav=nav)
+        menu='<nav class="menu"><a href="/">首页</a><a href="/#pricing">套餐</a><a href="/#models">模型广场</a><a href="/v1/models">模型列表</a><a href="/health">服务状态</a></nav>'
+        chip='<div class="user-chip"><a class="btn btn2 btn-sm" href="/login">登录</a><a class="btn btn-sm" href="/register">免费注册</a></div>'
+    nav=f'<header class="topbar"><div class="topbar-inner">{brand}{menu}{chip}</div></header>'
+    return render_template_string(HTML, body=body, nav=nav, site_name=h(SITE_NAME))
 
 def db():
     if not hasattr(g, 'db'):
@@ -161,13 +344,23 @@ CREATE TABLE IF NOT EXISTS email_activations(id INTEGER PRIMARY KEY AUTOINCREMEN
         except sqlite3.OperationalError: pass
     for k,v in {'epay_api_url': EPAY_API_URL, 'epay_pid': EPAY_PID, 'epay_key': EPAY_KEY, 'domain': DOMAIN, 'public_base_url': PUBLIC_BASE_URL, 'payment_enabled': '0' if not (EPAY_API_URL and EPAY_PID and EPAY_KEY) else '1', 'smtp_enabled': os.environ.get('SMTP_ENABLED','0'), 'smtp_host': os.environ.get('SMTP_HOST',''), 'smtp_port': os.environ.get('SMTP_PORT','587'), 'smtp_username': os.environ.get('SMTP_USERNAME',''), 'smtp_password': os.environ.get('SMTP_PASSWORD',''), 'smtp_encryption': os.environ.get('SMTP_ENCRYPTION','tls'), 'smtp_from_email': os.environ.get('SMTP_FROM_EMAIL',''), 'smtp_from_name': os.environ.get('SMTP_FROM_NAME','LLM Platform')}.items():
         c.execute('INSERT OR IGNORE INTO app_settings(key,value) VALUES(?,?)', (k, v or ''))
-    for idx,(pid,cfg) in enumerate(PLAN_CONFIG.items()):
+    _plans=plan_config_from_env(); _pov=plan_env_overrides()
+    for idx,(pid,cfg) in enumerate(_plans.items()):
         c.execute('INSERT OR IGNORE INTO plans(id,name,price,daily_tokens,rate_limit,days,is_active,sort_order,description) VALUES(?,?,?,?,?,?,?,?,?)', (pid,cfg['name'],cfg['price'],cfg['daily_tokens'],cfg['rate_limit'],cfg['days'],1,idx*10,cfg.get('description','')))
+        _f={k:v for k,v in (_pov.get(pid) or {}).items() if k in ('name','price','daily_tokens','rate_limit','days','description')}
+        if _f:
+            # 环境变量里显式给出的套餐字段以环境变量为准（覆盖容器内旧库里的值）
+            c.execute('UPDATE plans SET %s,updated_at=CURRENT_TIMESTAMP WHERE id=?' % ','.join('%s=?'%k for k in _f), tuple(_f.values())+(pid,))
     c.execute('INSERT OR IGNORE INTO managed_projects(name,slug,description,base_url,status,sort_order) VALUES(?,?,?,?,?,?)', ('默认 LLM 网关','llm-gateway','OpenAI 兼容接口与模型中转平台',PUBLIC_BASE_URL,'active',10))
     c.execute('DELETE FROM model_providers WHERE id NOT IN (SELECT MIN(id) FROM model_providers GROUP BY provider_type, model_id, base_url)')
     if not c.execute('SELECT 1 FROM model_providers WHERE provider_type=? AND model_id=? AND base_url=?',('ollama',MODEL_NAME,OLLAMA_BASE_URL)).fetchone():
         c.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order) VALUES(?,?,?,?,?,?,?,?,?)', ('本地 Ollama','ollama',OLLAMA_BASE_URL,'',MODEL_NAME,MODEL_NAME,1,1,10))
-    c.execute('INSERT OR IGNORE INTO users(username,email,password_hash,is_admin,invite_code,tokens_reset_date) VALUES(?,?,?,?,?,?)', ('admin','admin@example.com',generate_password_hash(ADMIN_PASSWORD),1,secrets.token_hex(6).upper(),dt.date.today().isoformat()))
+    c.execute('INSERT OR IGNORE INTO users(username,email,password_hash,is_admin,invite_code,tokens_reset_date) VALUES(?,?,?,?,?,?)', (ADMIN_USERNAME,ADMIN_EMAIL,generate_password_hash(ADMIN_PASSWORD),1,secrets.token_hex(6).upper(),dt.date.today().isoformat()))
+    try:
+        # 数据库中已存在同名 admin 时，把邮箱同步成环境变量里配置的地址
+        c.execute('UPDATE users SET email=? WHERE username=? AND email<>?', (ADMIN_EMAIL, ADMIN_USERNAME, ADMIN_EMAIL))
+    except sqlite3.IntegrityError:
+        pass
     seed_master_api_key(c)
     con.commit(); con.close()
     start_upstream_seed_thread()
@@ -384,7 +577,7 @@ def set_setting(key,value):
 def get_plan_config(include_inactive=False):
     where='' if include_inactive else ' WHERE is_active=1'
     rows=db().execute('SELECT * FROM plans'+where+' ORDER BY sort_order ASC, price ASC, id ASC').fetchall()
-    return {r['id']:{'name':r['name'],'price':float(r['price'] or 0),'daily_tokens':int(r['daily_tokens'] or 0),'rate_limit':int(r['rate_limit'] or 60),'days':int(r['days'] or 30),'description':r['description'] or '','is_active':int(r['is_active'] or 0)} for r in rows} or PLAN_CONFIG.copy()
+    return {r['id']:{'name':r['name'],'price':float(r['price'] or 0),'daily_tokens':int(r['daily_tokens'] or 0),'rate_limit':int(r['rate_limit'] or 60),'days':int(r['days'] or 30),'description':r['description'] or '','is_active':int(r['is_active'] or 0)} for r in rows} or plan_config_from_env()
 
 def public_base_url():
     st=get_settings()
@@ -943,18 +1136,68 @@ def ollama_status_html():
 
 @app.route('/')
 def index():
-    ollama=ollama_status_html()
     public_base=public_base_url(); plans=get_plan_config(); projects=db().execute('SELECT * FROM managed_projects ORDER BY sort_order ASC,id DESC LIMIT 12').fetchall()
-    cards=''.join([f'<div class="card"><span class="pill">{h(pid)}</span><h3>{h(v["name"])}</h3><div class="price">¥{v["price"]:g}</div><p class="muted">每日 {v["daily_tokens"]:,} tokens · 限速 {v["rate_limit"]}/分钟 · {v["days"]}天</p><p class="muted">{h(v.get("description",""))}</p><a class="btn" href="/dashboard">购买/使用</a></div>' for pid,v in plans.items()])
-    project_html=''.join([f'<div class="card"><span class="pill">{h(x["status"])}</span><h3>{h(x["name"])}</h3><p class="muted">{h(x["description"])}</p>'+(f'<a class="btn btn2" href="{h(x["base_url"])}">打开项目</a>' if x['base_url'] else '')+'</div>' for x in projects]) or '<div class="card">暂无项目</div>'
-    am=active_model_rows(); platform_models=''.join([f'<li><b>{h(m["model_id"])}</b> · {h(m["name"])} · {h(m["provider_type"])}</li>' for m in am]) or '<li>暂无启用模型</li>'
-    u=current_user(); admin_debug=''
-    if u:
-        model_card=f'<div class="card"><h3>平台可用模型</h3><ul>{platform_models}</ul><p class="muted">接口地址 <b>{h(public_base)}/v1</b>；完整接入示例见 <a href="/dashboard">用户控制台</a>。</p></div>'
-        api_card=f'<div class="card"><h3>OpenAI 兼容接口</h3><pre>curl {h(public_base)}/v1/models\nPOST {h(public_base)}/v1/chat/completions</pre></div>' if u['is_admin'] else ''
-        admin_debug=api_card+model_card
-    body=f'<div class="grid"><div class="card"><h3>平台状态</h3><p>Web 网关：<span class="ok">运行中</span></p><p>默认模型：<b>{h((am[0]["model_id"] if am else MODEL_NAME))}</b></p><p>可用模型：<b>{len(am)}</b> 个</p><p class="muted">OpenAI 兼容接口：<b>{h(public_base)}/v1</b> · 登录后可创建 API Key 并在 <a href="/playground">聊天测试</a> 页验证。</p></div>{admin_debug}</div><h2>套餐</h2><div class="grid">{cards}</div><h2>管理项目</h2><div class="grid">{project_html}</div>'
+    am=active_model_rows(); default_model=(am[0]['model_id'] if am else MODEL_NAME)
+    providers=sorted(set((m['name'] or '') for m in am if m['name']))
+    rows=''
+    for m in am[:120]:
+        mods=' '.join('<span class="pill pill-gray">%s</span>'%h(x) for x in sorted(get_provider_modalities(m)))
+        key=((m['model_id'] or '')+' '+(m['name'] or '')).lower()
+        rows+=f'<tr class="model-row" data-k="{h(key)}"><td><b>{h(m["model_id"])}</b></td><td><span class="pill">{h(m["name"])}</span></td><td>{mods}</td><td class="muted">{h(get_provider_endpoint_type(m))}</td></tr>'
+    more=(f'<p class="muted">仅展示前 120 个，完整列表见 <a href="/v1/models">/v1/models</a>（共 {len(am)} 个）。</p>' if len(am)>120 else '')
+    cards=''
+    for i,(pid,v) in enumerate(plans.items()):
+        feat=[f'每日 {v["daily_tokens"]:,} tokens', f'限速 {v["rate_limit"]} 次/分钟', f'有效期 {v["days"]} 天', v.get('description') or '']
+        lis=''.join('<li>%s</li>'%h(x) for x in feat if x)
+        featured=' featured' if len(plans)>1 and i==1 else ''
+        cta=('<a class="btn" href="/register">免费开始</a>' if float(v['price'])<=0 else '<a class="btn" href="/dashboard">立即购买</a>')
+        cards+=f'<div class="card plan-card{featured}"><span class="pill">{h(pid)}</span><h3 style="margin-top:10px">{h(v["name"])}</h3><div class="price"><small>¥</small>{v["price"]:g}</div><ul>{lis}</ul>{cta}</div>'
+    project_html=''.join([f'<div class="card"><span class="pill">{h(x["status"])}</span><h3 style="margin-top:10px">{h(x["name"])}</h3><p class="muted">{h(x["description"])}</p>'+(f'<a class="btn btn2" href="{h(x["base_url"])}">打开项目</a>' if x['base_url'] else '')+'</div>' for x in projects]) or '<div class="card">暂无项目</div>'
+    model_filter_js = (
+        '<script>'
+        'document.addEventListener("DOMContentLoaded",function(){'
+        'var i=document.getElementById("modelSearch"); if(!i) return;'
+        'i.addEventListener("input",function(){'
+        'var q=i.value.toLowerCase().trim();'
+        'document.querySelectorAll(".model-row").forEach(function(r){'
+        'var hit=(!q)||((r.getAttribute("data-k")||"").indexOf(q)>=0);'
+        'r.style.display=hit?"":"none";});});});'
+        '</script>'
+    )
+    body=f'''<section class="hero">
+<span class="hero-tag">OpenAI 兼容 · 多上游聚合 · 统一计费</span>
+<h1>一个 Base URL，调用全部大模型</h1>
+<p>已接入 {len(providers)} 家上游、{len(am)} 个模型；支持 Chat Completions / Responses / Anthropic Messages 三种协议，按套餐统一限速与计量。</p>
+<div class="hero-actions"><a class="btn btn-light" href="/register">免费注册</a><a class="btn btn-ghost" href="/playground">在线试用</a></div>
+<div class="hero-stats"><div><b>{len(am)}</b><span>可用模型</span></div><div><b>{len(providers)}</b><span>上游供应商</span></div><div><b>{h(default_model)}</b><span>默认模型</span></div><div><b>{ollama_status_html()}</b><span>本地 Ollama</span></div></div>
+</section>
+<div class="two"><div class="card"><h3>快速接入</h3><p class="muted">在用户控制台创建 API Key，把 Base URL 指向下面地址即可，任何 OpenAI SDK / 客户端都能直接用。</p><div class="copy-box">Base URL：{h(public_base)}/v1</div><pre>curl {h(public_base)}/v1/chat/completions \\
+  -H "Authorization: Bearer sk-你的KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{{"model":"{h(default_model)}","messages":[{{"role":"user","content":"你好"}}]}}'</pre><p class="muted">若反代链路会丢弃 Authorization 头，可改用路径写法：<code>{h(public_base)}/k/&lt;你的KEY&gt;/v1</code></p></div>
+<div class="card"><h3>平台状态</h3><p>Web 网关：<span class="ok">运行中</span></p><p>默认模型：<b>{h(default_model)}</b></p><p>可用模型：<b>{len(am)}</b> 个 · 上游供应商 <b>{len(providers)}</b> 家</p><p class="muted">模型配置由环境变量自动播种，重新部署后自动恢复；登录后可在 <a href="/dashboard">用户控制台</a> 创建 Key、查看用量/订单/工单。</p></div></div>
+<div class="section-head" id="models"><h2>模型广场</h2><span class="muted">共 {len(am)} 个可用模型</span></div>
+<div class="card"><input class="input model-search" id="modelSearch" placeholder="搜索模型或供应商，例如 deepseek / qwen / amd"><table><tr><th>模型 ID</th><th>上游</th><th>能力</th><th>协议</th></tr>{rows or '<tr><td colspan="4">暂无启用模型</td></tr>'}</table>{more}</div>
+<div class="section-head" id="pricing"><h2>套餐价格</h2><span class="muted">价格/额度可在后台或环境变量调整</span></div>
+<div class="grid">{cards}</div>
+<div class="section-head"><h2>管理项目</h2></div>
+<div class="grid">{project_html}</div>
+{model_filter_js}'''
     return page(body)
+
+def auth_card(title,subtitle,form_html,msg=''):
+    return page(f'<div class="auth"><div class="auth-head"><h2>{h(title)}</h2><p>{h(subtitle)}</p></div><div class="auth-card">{msg}{form_html}</div></div>')
+
+def login_form_html():
+    return ('<form method="post"><label>用户名 / 邮箱</label><input class="input" name="username" placeholder="admin 或 admin@ypvps.com" autocomplete="username">'
+            '<label>密码</label><input class="input" type="password" name="password" placeholder="请输入密码" autocomplete="current-password">'
+            '<button class="btn">登录</button></form><div class="auth-switch">还没有账号？<a href="/register">免费注册</a></div>')
+
+def register_form_html():
+    return ('<form method="post"><label>用户名</label><input class="input" name="username" placeholder="3-32 位字母 / 数字 / 下划线">'
+            '<label>邮箱</label><input class="input" name="email" placeholder="you@example.com">'
+            '<label>密码</label><input class="input" type="password" name="password" placeholder="至少 6 位">'
+            '<button class="btn">注册账号</button></form><div class="auth-switch">已有账号？<a href="/login">直接登录</a></div>')
 
 @app.route('/login',methods=['GET','POST'])
 def login():
@@ -964,11 +1207,10 @@ def login():
         u=db().execute('SELECT * FROM users WHERE username=? OR email=?',(name,name)).fetchone()
         if u and check_password_hash(u['password_hash'],pw):
             if not u['is_active']:
-                msg='<p class="bad">账号未激活，请先前往邮箱点击激活链接</p>'
-                return page(f'<div class="card"><h2>登录</h2>{msg}<form method="post"><input class="input" name="username" placeholder="用户名/邮箱"><input class="input" type="password" name="password" placeholder="密码"><button class="btn">登录</button> <a href="/register">注册</a></form></div>')
+                return auth_card('登录','使用 OpenAI 兼容接口，登录后即可创建 API Key','<p class="bad">账号未激活，请先前往邮箱点击激活链接</p>'+login_form_html())
             session['uid']=u['id']; db().execute('UPDATE users SET last_login=CURRENT_TIMESTAMP WHERE id=?',(u['id'],)); db().commit(); return redirect('/dashboard')
         msg='<p class="bad">账号或密码错误</p>'
-    return page(f'<div class="card"><h2>登录</h2>{msg}<form method="post"><input class="input" name="username" placeholder="用户名/邮箱"><input class="input" type="password" name="password" placeholder="密码"><button class="btn">登录</button> <a href="/register">注册</a></form></div>')
+    return auth_card('登录','使用 OpenAI 兼容接口，登录后即可创建 API Key',login_form_html(),msg)
 
 @app.route('/register',methods=['GET','POST'])
 def register():
@@ -980,20 +1222,23 @@ def register():
         elif len(pw)<6: msg='<p class="bad">密码至少 6 位</p>'
         else:
             try:
-                con=db(); cur=con.execute('INSERT INTO users(username,email,password_hash,invite_code,tokens_reset_date,is_active) VALUES(?,?,?,?,?,0)',(username,email,generate_password_hash(pw),secrets.token_hex(6).upper(),dt.date.today().isoformat())); con.commit()
-                send_activation_email(cur.lastrowid,email)
-                return page('<div class="card"><h2>注册成功</h2><p class="ok">激活邮件已发送，请前往邮箱点击链接完成注册。</p><p><a class="btn" href="/login">去登录</a></p></div>')
+                con=db(); mail_on=(get_settings().get('smtp_enabled')=='1')
+                cur=con.execute('INSERT INTO users(username,email,password_hash,invite_code,tokens_reset_date,is_active) VALUES(?,?,?,?,?,?)',(username,email,generate_password_hash(pw),secrets.token_hex(6).upper(),dt.date.today().isoformat(),1 if not mail_on else 0)); con.commit()
+                if mail_on:
+                    send_activation_email(cur.lastrowid,email)
+                    return auth_card('注册成功','还需一步：完成邮箱验证','<p class="ok">激活邮件已发送，请点击邮件里的链接完成注册。</p><p><a class="btn" href="/login">去登录</a></p>')
+                return auth_card('注册成功','当前未启用邮件服务，账号已自动激活','<p class="ok">可以直接登录并创建 API Key 了。</p><p><a class="btn" href="/login">去登录</a></p>')
             except Exception as e: msg=f'<p class="bad">注册失败：{h(e)}</p>'
-    return page(f'<div class="card"><h2>注册</h2>{msg}<form method="post"><input class="input" name="username" placeholder="用户名"><input class="input" name="email" placeholder="邮箱"><input class="input" type="password" name="password" placeholder="密码"><button class="btn">注册</button></form></div>')
+    return auth_card('创建账号','注册即可使用免费套餐，随后创建 API Key',register_form_html(),msg)
 
 @app.route('/activate')
 def activate():
     token=request.args.get('token','').strip(); con=db()
     row=con.execute('SELECT * FROM email_activations WHERE token=? AND used_at IS NULL',(token,)).fetchone()
-    if not row: return page('<div class="card"><h2>激活失败</h2><p class="bad">激活链接无效或已使用。</p></div>'),400
-    if dt.datetime.fromisoformat(row['expires_at']) < dt.datetime.now(): return page('<div class="card"><h2>激活失败</h2><p class="bad">激活链接已过期，请重新注册或联系管理员。</p></div>'),400
+    if not row: return auth_card('激活失败','激活链接无效','<p class="bad">链接无效或已被使用。</p><p><a class="btn" href="/register">重新注册</a></p>'),400
+    if dt.datetime.fromisoformat(row['expires_at']) < dt.datetime.now(): return auth_card('激活失败','激活链接已过期','<p class="bad">请重新注册，或联系管理员手动激活。</p><p><a class="btn" href="/register">重新注册</a></p>'),400
     con.execute('UPDATE users SET is_active=1,email_verified_at=CURRENT_TIMESTAMP WHERE id=?',(row['user_id'],)); con.execute('UPDATE email_activations SET used_at=CURRENT_TIMESTAMP WHERE id=?',(row['id'],)); con.commit()
-    return page('<div class="card"><h2>账号已激活</h2><p class="ok">邮箱验证成功，现在可以登录使用。</p><p><a class="btn" href="/login">去登录</a></p></div>')
+    return auth_card('账号已激活','邮箱验证成功','<p class="ok">现在可以登录并创建 API Key 了。</p><p><a class="btn" href="/login">去登录</a></p>')
 
 @app.route('/logout')
 def logout(): session.clear(); return redirect('/')
@@ -1294,6 +1539,57 @@ def admin():
                 con.commit(); msg='管理项目已保存'
             else: msg='项目 slug 格式错误'
         elif act=='delete_project': con.execute('DELETE FROM managed_projects WHERE id=?',(request.form.get('project_id'),)); con.commit(); msg='管理项目已删除'
+        elif act=='bulk_models':
+            # 按"上游同名"批量维护：一次操作该供应商名下所有模型行
+            pname=request.form.get('provider_name','').strip()
+            op=request.form.get('op','').strip()
+            val=request.form.get('value','').strip()
+            extra=request.form.get('extra','').strip()
+            if not pname:
+                msg='请先选择要维护的上游名称'
+            elif op=='enable':
+                cur=con.execute('UPDATE model_providers SET is_active=1,updated_at=CURRENT_TIMESTAMP WHERE name=?',(pname,)); con.commit(); msg='已启用「%s」的 %s 个模型' % (pname,cur.rowcount)
+            elif op=='disable':
+                cur=con.execute('UPDATE model_providers SET is_active=0,updated_at=CURRENT_TIMESTAMP WHERE name=?',(pname,)); con.commit(); msg='已禁用「%s」的 %s 个模型' % (pname,cur.rowcount)
+            elif op=='delete':
+                cur=con.execute('DELETE FROM model_providers WHERE name=?',(pname,)); con.commit(); msg='已删除「%s」的 %s 个模型' % (pname,cur.rowcount)
+            elif op=='key':
+                if not val: msg='请填写新的 API Key'
+                else:
+                    cur=con.execute('UPDATE model_providers SET api_key=?,updated_at=CURRENT_TIMESTAMP WHERE name=?',(val,pname)); con.commit(); msg='已把「%s」的 %s 个模型统一改为新 Key' % (pname,cur.rowcount)
+            elif op=='base':
+                if not val.startswith('http'): msg='Base URL 必须以 http 开头'
+                else:
+                    cur=con.execute('UPDATE model_providers SET base_url=?,updated_at=CURRENT_TIMESTAMP WHERE name=?',(val.rstrip('/'),pname)); con.commit(); msg='已把「%s」的 %s 个模型统一改为 %s' % (pname,cur.rowcount,val)
+            elif op=='timeout':
+                try: t=int(val)
+                except ValueError: t=0
+                if t<=0: msg='超时必须是正整数秒'
+                else:
+                    cur=con.execute('UPDATE model_providers SET timeout_seconds=?,updated_at=CURRENT_TIMESTAMP WHERE name=?',(t,pname)); con.commit(); msg='已把「%s」的 %s 个模型超时统一设为 %s 秒' % (pname,cur.rowcount,t)
+            elif op=='rename':
+                if not val: msg='请填写新的供应商名称'
+                else:
+                    cur=con.execute('UPDATE model_providers SET name=?,updated_at=CURRENT_TIMESTAMP WHERE name=?',(val,pname)); con.commit(); msg='已把「%s」重命名为「%s」，共 %s 个模型' % (pname,val,cur.rowcount)
+            elif op=='default':
+                con.execute('UPDATE model_providers SET is_default=0')
+                if extra:
+                    cur=con.execute('UPDATE model_providers SET is_default=1 WHERE name=? AND model_id=?',(pname,extra))
+                    hit=cur.rowcount
+                else:
+                    row=con.execute('SELECT id FROM model_providers WHERE name=? ORDER BY sort_order ASC,id ASC LIMIT 1',(pname,)).fetchone()
+                    hit=con.execute('UPDATE model_providers SET is_default=1 WHERE id=?',(row['id'],)).rowcount if row else 0
+                con.commit(); msg=('已把「%s」的 %s 设为默认模型' % (pname,extra)) if hit else '没有找到要设为默认的模型'
+            elif op=='ocr_off':
+                cur=con.execute("UPDATE model_providers SET is_active=0,updated_at=CURRENT_TIMESTAMP WHERE name=? AND modalities LIKE '%ocr%' AND modalities NOT LIKE '%text%'",(pname,)); con.commit(); msg='已禁用「%s」下 %s 个纯 OCR 模型（聊天客户端无法调用它们）' % (pname,cur.rowcount)
+            elif op=='resort':
+                try: base_num=int(extra) if extra else 100
+                except ValueError: base_num=100
+                rows=con.execute('SELECT id FROM model_providers WHERE name=? ORDER BY sort_order ASC,id ASC',(pname,)).fetchall()
+                for i,row in enumerate(rows): con.execute('UPDATE model_providers SET sort_order=? WHERE id=?',(base_num+i,row['id']))
+                con.commit(); msg='已把「%s」的 %s 个模型排序重排为 %s 起连续编号' % (pname,len(rows),base_num)
+            else:
+                msg='未知的批量操作：%s' % op
         elif act=='save_model':
             mid=request.form.get('model_row_id')
             modalities=[]
@@ -1354,10 +1650,26 @@ def admin():
     new_model='''<tr><td>新建<form method="post"><input type="hidden" name="act" value="save_model"></td><td><input class="input mini" name="name" placeholder="供应商名"><br><select class="input mini" name="endpoint_type"><option value="chat_completions">OpenAI Chat</option><option value="responses">OpenAI Responses</option><option value="anthropic_messages">Anthropic Messages</option></select></td><td><select class="input mini" name="provider_type"><option value="openai">HTTP API</option><option value="ollama">Ollama</option></select></td><td><input class="input" name="base_url" placeholder="https://api.xxx/v1"><br><input class="input" name="extra_config" value="{}"></td><td><input class="input" name="api_key"></td><td><input class="input mini" name="model_id" placeholder="gpt-4o-mini"><br><input class="input mini" name="display_name"></td><td><select name="is_default" class="input mini"><option value="0">默认否</option><option value="1">默认是</option></select><select name="is_active" class="input mini"><option value="1">启用</option><option value="0">禁用</option></select></td><td><label><input type="checkbox" name="mod_text" value="1" checked>文</label><label><input type="checkbox" name="mod_image" value="1">图</label><label><input type="checkbox" name="mod_video" value="1">视频</label><label><input type="checkbox" name="mod_audio" value="1">音频</label><br><select name="supports_stream" class="input mini"><option value="1">stream开</option><option value="0">stream关</option></select><select name="supports_tools" class="input mini"><option value="0">tools关</option><option value="1">tools开</option></select></td><td><input class="input mini" name="sort_order" value="100"><input class="input mini" name="timeout_seconds" value="300"><input class="input mini" name="max_input_tokens" placeholder="输入token"><input class="input mini" name="max_output_tokens" placeholder="输出token"></td><td><button class="btn">新增</button></form></td></tr>'''
     discover_form='''<form method="post"><input type="hidden" name="act" value="discover_models"><div class="grid"><div><label>供应商名称</label><input class="input" name="name" placeholder="例如：硅基流动/自建 NewAPI"></div><div><label>Base URL</label><input class="input" name="base_url" placeholder="https://api.xxx/v1"></div><div><label>API Key</label><input class="input" name="api_key" placeholder="sk-..."></div><div><label>排序</label><input class="input" name="sort_order" value="100"></div><div><label>读取超时秒</label><input class="input" name="timeout_seconds" value="20"></div></div><button class="btn btn2">通过 /v1/models 自动读取并批量导入</button></form><form method="post" style="margin-top:8px"><input type="hidden" name="act" value="detect_model_caps"><button class="btn btn2">一键重新识别全部模型多模态能力</button><span class="muted">按上游元数据和模型名规则识别，不消耗对话额度。</span></form>'''
     usage_html=''.join([f'<tr><td>{h(u["username"])}</td><td>{u["calls"]}</td><td>{u["total_tokens"]}</td><td>{h(u["last_at"])}</td></tr>' for u in usage]) or '<tr><td colspan="4">暂无调用日志</td></tr>'
+    # ---- 按上游名称汇总，支持一次性批量维护该上游下所有模型行 ----
+    prov_agg={}
+    for r in con.execute('SELECT name,provider_type,base_url,api_key,count(*) n,sum(is_active) a,sum(is_default) d FROM model_providers GROUP BY name,provider_type,base_url,api_key'):
+        g=prov_agg.setdefault(r['name'],{'n':0,'a':0,'d':0,'types':set(),'bases':[],'keys':[]})
+        g['n']+=r['n']; g['a']+=r['a'] or 0; g['d']+=r['d'] or 0
+        g['types'].add(r['provider_type'])
+        if r['base_url'] and r['base_url'] not in g['bases']: g['bases'].append(r['base_url'])
+        if r['api_key'] and r['api_key'] not in g['keys']: g['keys'].append(r['api_key'])
+    _bulk=[]
+    for nm,g in sorted(prov_agg.items(), key=lambda kv:(-kv[1]['n'], kv[0])):
+        bases='<br>'.join('<span class="key-line">%s</span>'%h(b) for b in g['bases'][:2])+(('<br><span class="muted">…共 %s 个不同地址</span>'%len(g['bases'])) if len(g['bases'])>2 else '')
+        keyinfo=('<br>'.join(h(k[:8]+'…'+k[-4:]) for k in g['keys'][:1])) or '<span class="muted">-</span>'
+        _bulk.append(f'''<tr><td><b>{h(nm)}</b><br><span class="muted">{h('/'.join(sorted(g['types'])))}</span></td><td>{g['n']}</td><td>{g['a']}</td><td>{g['d']}</td><td>{bases}</td><td>{keyinfo}</td><td><form method="post" class="inline-form"><input type="hidden" name="act" value="bulk_models"><input type="hidden" name="provider_name" value="{h(nm)}"><select name="op" class="input mini"><option value="enable">启用全部</option><option value="disable">禁用全部</option><option value="delete">删除全部</option><option value="ocr_off">禁用纯OCR模型</option><option value="default">设为默认模型</option><option value="key">统一改 API Key</option><option value="base">统一改 Base URL</option><option value="timeout">统一改超时秒</option><option value="resort">重排排序号</option><option value="rename">重命名该上游</option></select><input class="input mini" name="value" placeholder="新值（Key/Base/超时/新名称）"><input class="input mini" name="extra" placeholder="可选：默认模型ID / 排序基准"><button class="btn btn2">执行</button></form></td></tr>''')
+    bulk_html=''.join(_bulk) or '<tr><td colspan="7">暂无模型供应商</td></tr>'
+    bulk_section=f'''<h3>按上游批量维护</h3><p class="muted">同一"上游名称"下的模型会被一起处理：换 Key、换 Base URL、批量启停、重命名、重排排序，不用再逐行点保存。</p>
+<table width="100%"><tr><th>上游</th><th>模型数</th><th>启用</th><th>默认</th><th>Base URL</th><th>Key</th><th>批量操作</th></tr>{bulk_html}</table>'''
     body=f'''<div class="card"><h2>管理后台</h2>{'<p class="ok">'+h(msg)+'</p>' if msg else ''}
 <h3>易支付配置</h3><p>当前支付状态：{pay_status}</p><form method="post"><input type="hidden" name="act" value="save_epay"><div class="grid"><div><label>启用支付</label><select class="input" name="payment_enabled"><option value="0" {sel(st.get('payment_enabled'),'0')}>禁用/演示</option><option value="1" {sel(st.get('payment_enabled'),'1')}>启用</option></select></div><div><label>易支付网关</label><input class="input" name="epay_api_url" value="{h(st.get('epay_api_url',''))}" placeholder="https://epay.example.com"></div><div><label>商户 PID</label><input class="input" name="epay_pid" value="{h(st.get('epay_pid',''))}"></div><div><label>商户 Key</label><input class="input" name="epay_key" value="{h(st.get('epay_key',''))}"></div><div><label>域名</label><input class="input" name="domain" value="{h(st.get('domain',''))}"></div><div><label>公网 Base URL</label><input class="input" name="public_base_url" value="{h(st.get('public_base_url',''))}"></div></div><button class="btn">保存易支付配置</button></form>
 <h3>SMTP 邮件配置</h3><form method="post"><input type="hidden" name="act" value="save_smtp"><div class="grid"><div><label>启用 SMTP</label><select class="input" name="smtp_enabled"><option value="0" {sel(st.get('smtp_enabled'),'0')}>禁用</option><option value="1" {sel(st.get('smtp_enabled'),'1')}>启用</option></select></div><div><label>SMTP Host</label><input class="input" name="smtp_host" value="{h(st.get('smtp_host',''))}" placeholder="smtp.example.com"></div><div><label>端口</label><input class="input" name="smtp_port" value="{h(st.get('smtp_port','587'))}"></div><div><label>加密</label><select class="input" name="smtp_encryption"><option value="tls" {sel(st.get('smtp_encryption'),'tls')}>TLS/STARTTLS</option><option value="ssl" {sel(st.get('smtp_encryption'),'ssl')}>SSL</option><option value="none" {sel(st.get('smtp_encryption'),'none')}>不加密</option></select></div><div><label>账号</label><input class="input" name="smtp_username" value="{h(st.get('smtp_username',''))}"></div><div><label>密码/授权码</label><input class="input" name="smtp_password" value="{h(st.get('smtp_password',''))}"></div><div><label>发件邮箱</label><input class="input" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"></div><div><label>发件名称</label><input class="input" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"></div></div><button class="btn">保存 SMTP 配置</button></form><form method="post"><input type="hidden" name="act" value="test_smtp"><input type="hidden" name="smtp_enabled" value="{h(st.get('smtp_enabled','0'))}"><input type="hidden" name="smtp_host" value="{h(st.get('smtp_host',''))}"><input type="hidden" name="smtp_port" value="{h(st.get('smtp_port','587'))}"><input type="hidden" name="smtp_username" value="{h(st.get('smtp_username',''))}"><input type="hidden" name="smtp_password" value="{h(st.get('smtp_password',''))}"><input type="hidden" name="smtp_encryption" value="{h(st.get('smtp_encryption','tls'))}"><input type="hidden" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"><input type="hidden" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"><div class="grid"><div><label>测试收件邮箱</label><input class="input" name="test_email" value="{h(current_user()['email'] or '')}"></div></div><button class="btn btn2">发送测试邮件</button></form>
-{openai_compat_docs_html(st.get('public_base_url') or PUBLIC_BASE_URL)}<h3>模型配置管理（三方 OpenAI 兼容/Ollama 中转）</h3><p class="muted">OpenAI 兼容供应商支持填写 Base URL + API Key 后自动请求 <code>/models</code> 批量导入模型 ID；多模态能力请按上游真实能力勾选，网关会据此做路由过滤。</p>{discover_form}<table width="100%"><tr><th>ID</th><th>名称/协议</th><th>类型</th><th>Base URL/扩展</th><th>API Key</th><th>模型ID/显示名</th><th>状态</th><th>能力</th><th>排序/超时/Token</th><th>操作</th></tr>{model_html}{new_model}</table>
+{openai_compat_docs_html(st.get('public_base_url') or PUBLIC_BASE_URL)}{bulk_section}<h3>模型配置管理（三方 OpenAI 兼容/Ollama 中转）</h3><p class="muted">OpenAI 兼容供应商支持填写 Base URL + API Key 后自动请求 <code>/models</code> 批量导入模型 ID；多模态能力请按上游真实能力勾选，网关会据此做路由过滤。</p>{discover_form}<table width="100%"><tr><th>ID</th><th>名称/协议</th><th>类型</th><th>Base URL/扩展</th><th>API Key</th><th>模型ID/显示名</th><th>状态</th><th>能力</th><th>排序/超时/Token</th><th>操作</th></tr>{model_html}{new_model}</table>
 <h3>套餐 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>价格</th><th>日额度</th><th>RPM</th><th>天数</th><th>状态</th><th>排序</th><th>说明</th><th>操作</th></tr>{plan_html}{new_plan}</table>
 <h3>管理项目 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>Slug</th><th>说明</th><th>链接</th><th>状态</th><th>排序</th><th>操作</th></tr>{proj_html}{new_proj}</table>
 <h3>用户 / 套餐 / 额度</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>套餐</th><th>自定义额度 / Key数</th><th>到期</th><th>余额</th><th>状态</th><th>今日已用</th><th>操作</th></tr>{uh}</table>
