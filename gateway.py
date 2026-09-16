@@ -7,6 +7,7 @@ import secrets
 import sqlite3
 import datetime as dt
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import wraps
 from urllib.parse import urlencode
 from html import escape
@@ -333,6 +334,7 @@ CREATE TABLE IF NOT EXISTS ticket_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,
 CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY,name TEXT NOT NULL,price REAL DEFAULT 0,daily_tokens INTEGER DEFAULT 0,rate_limit INTEGER DEFAULT 60,days INTEGER DEFAULT 30,is_active INTEGER DEFAULT 1,sort_order INTEGER DEFAULT 100,description TEXT DEFAULT '',updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS managed_projects(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,slug TEXT UNIQUE NOT NULL,description TEXT DEFAULT '',base_url TEXT DEFAULT '',status TEXT DEFAULT 'active',sort_order INTEGER DEFAULT 100,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS model_providers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,provider_type TEXT DEFAULT 'openai',base_url TEXT DEFAULT '',api_key TEXT DEFAULT '',model_id TEXT NOT NULL,display_name TEXT DEFAULT '',is_default INTEGER DEFAULT 0,is_active INTEGER DEFAULT 1,sort_order INTEGER DEFAULT 100,timeout_seconds INTEGER DEFAULT 300,endpoint_type TEXT DEFAULT 'chat_completions',modalities TEXT DEFAULT '["text"]',supports_stream INTEGER DEFAULT 1,supports_tools INTEGER DEFAULT 0,supports_vision INTEGER DEFAULT 0,supports_video INTEGER DEFAULT 0,max_input_tokens INTEGER,max_output_tokens INTEGER,extra_config TEXT DEFAULT '{}',created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS model_stats(provider_id INTEGER PRIMARY KEY,ok_count INTEGER DEFAULT 0,fail_count INTEGER DEFAULT 0,avg_ms REAL DEFAULT 0,last_ms REAL DEFAULT 0,fail_streak INTEGER DEFAULT 0,last_error TEXT DEFAULT '',updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS invoices(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,order_id INTEGER NOT NULL,invoice_no TEXT UNIQUE NOT NULL,company_name TEXT NOT NULL,tax_id TEXT,amount REAL NOT NULL,status TEXT DEFAULT 'pending',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(user_id) REFERENCES users(id),FOREIGN KEY(order_id) REFERENCES orders(id));
 CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY,value TEXT DEFAULT '',updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS email_activations(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,email TEXT NOT NULL,token TEXT UNIQUE NOT NULL,expires_at TEXT NOT NULL,used_at TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(user_id) REFERENCES users(id));
@@ -784,15 +786,200 @@ def epay_sign(params):
 def active_model_rows():
     return db().execute('SELECT * FROM model_providers WHERE is_active=1 ORDER BY is_default DESC, sort_order ASC, id ASC').fetchall()
 
+# ---------- 模型响应速度统计：auto 模式据此优先挑"反应快"的模型 ----------
+AUTO_UNKNOWN_MS = float(os.environ.get('AUTO_UNKNOWN_MS', '2500'))        # 未测过模型的中性分
+AUTO_FAIL_PENALTY_MS = float(os.environ.get('AUTO_FAIL_PENALTY_MS', '6000'))  # 失败折算的惩罚毫秒
+AUTO_SORT_MODE = (os.environ.get('AUTO_SORT_MODE', 'speed') or 'speed').strip().lower()  # speed | manual
+
+def model_stats_map():
+    """{provider_id: stats_row}，只读，供排序用。"""
+    try:
+        return {int(r['provider_id']): r for r in db().execute('SELECT * FROM model_stats').fetchall()}
+    except Exception:
+        return {}
+
+def model_auto_score(row, stats):
+    """分数越低越优先。没有统计数据的模型给中性分，保证新模型仍会被探索到。"""
+    st = stats.get(int(row['id'])) if stats else None
+    if not st:
+        return AUTO_UNKNOWN_MS
+    try:
+        ok = int(st['ok_count'] or 0); bad = int(st['fail_count'] or 0)
+        streak = int(st['fail_streak'] or 0); avg = float(st['avg_ms'] or 0)
+    except Exception:
+        return AUTO_UNKNOWN_MS
+    if ok == 0 and bad > 0:
+        return AUTO_UNKNOWN_MS + AUTO_FAIL_PENALTY_MS          # 从来没成功过，排到最后
+    if streak >= 2:
+        return AUTO_UNKNOWN_MS + AUTO_FAIL_PENALTY_MS * streak  # 连续失败越多越靠后
+    if avg <= 0:
+        return AUTO_UNKNOWN_MS
+    rate = bad / float(ok + bad) if (ok + bad) else 0.0
+    return avg + rate * AUTO_FAIL_PENALTY_MS
+
+def auto_sorted_rows(rows):
+    """auto 模式排序：非本地优先 → 实测延迟升序 → 默认模型 → 手工顺序。"""
+    if AUTO_SORT_MODE == 'manual':
+        return sorted(rows, key=lambda r: (0 if r['provider_type'] != 'ollama' else 1,
+                                           0 if r['is_default'] else 1,
+                                           int(r['sort_order'] or 100), int(r['id'])))
+    stats = model_stats_map()
+    return sorted(rows, key=lambda r: (0 if r['provider_type'] != 'ollama' else 1,
+                                       model_auto_score(r, stats),
+                                       0 if r['is_default'] else 1,
+                                       int(r['sort_order'] or 100), int(r['id'])))
+
+def _stats_conn():
+    con = sqlite3.connect(DB_PATH, timeout=20)
+    try:
+        con.execute('PRAGMA busy_timeout=20000')
+        con.execute('PRAGMA journal_mode=WAL')
+    except sqlite3.Error:
+        pass
+    return con
+
+def record_model_result(provider_id, ok, ms=0, error=''):
+    """记录一次上游调用结果（EWMA 平均延迟 + 失败计数）。任何异常都不影响主流程。"""
+    try:
+        con = _stats_conn()
+        try:
+            row = con.execute('SELECT ok_count,fail_count,avg_ms,fail_streak FROM model_stats WHERE provider_id=?',
+                              (int(provider_id),)).fetchone()
+            if row:
+                ok_c, bad_c, avg, streak = int(row[0] or 0), int(row[1] or 0), float(row[2] or 0), int(row[3] or 0)
+            else:
+                ok_c, bad_c, avg, streak = 0, 0, 0.0, 0
+            err = ''
+            if ok:
+                avg = float(ms) if ok_c == 0 else avg * 0.7 + float(ms) * 0.3
+                ok_c += 1; streak = 0
+            else:
+                bad_c += 1; streak += 1; err = str(error)[:200]
+            if row:
+                con.execute('UPDATE model_stats SET ok_count=?,fail_count=?,avg_ms=?,last_ms=?,fail_streak=?,last_error=?,updated_at=CURRENT_TIMESTAMP WHERE provider_id=?',
+                            (ok_c, bad_c, avg, float(ms or 0), streak, err, int(provider_id)))
+            else:
+                con.execute('INSERT INTO model_stats(provider_id,ok_count,fail_count,avg_ms,last_ms,fail_streak,last_error) VALUES(?,?,?,?,?,?,?)',
+                            (int(provider_id), ok_c, bad_c, avg, float(ms or 0), streak, err))
+            con.commit()
+        finally:
+            con.close()
+    except Exception as e:
+        print('[stats] record failed (ignored):', e)
+
+def reset_model_stats():
+    try:
+        con = _stats_conn()
+        try:
+            con.execute('DELETE FROM model_stats'); con.commit()
+        finally:
+            con.close()
+        return True
+    except Exception as e:
+        print('[stats] reset failed:', e); return False
+
+# ---------- 后台「一键测速」：实测每个模型的响应速度 ----------
+PROBE_STATE = {'running': False, 'total': 0, 'done': 0, 'ok': 0, 'fail': 0,
+               'started_at': '', 'finished_at': '', 'last': []}
+
+def _probe_targets():
+    """需要测速的模型行（跳过本地 Ollama 与 OCR 专用端点）。"""
+    con = _stats_conn(); con.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in con.execute('SELECT * FROM model_providers WHERE is_active=1 ORDER BY id').fetchall()]
+    finally:
+        con.close()
+    out = []
+    for r in rows:
+        if (r.get('provider_type') or '') == 'ollama':
+            continue
+        if (r.get('endpoint_type') or 'chat_completions') == 'ocr':
+            continue
+        if not (r.get('base_url') or '').strip():
+            continue
+        out.append(r)
+    return out
+
+def _probe_one(row, timeout=None):
+    """对单个模型发一次最小请求，返回 (ok, ms, error)。"""
+    base = (row.get('base_url') or '').rstrip('/')
+    et = row.get('endpoint_type') or 'chat_completions'
+    key = row.get('api_key') or ''
+    tmo = int(timeout or min(int(row.get('timeout_seconds') or 30), int(os.environ.get('PROBE_TIMEOUT', '30'))))
+    headers = {'Content-Type': 'application/json'}
+    if key:
+        headers['Authorization'] = 'Bearer ' + key
+    t0 = time.time()
+    try:
+        if et == 'anthropic_messages':
+            url = base + '/messages'
+            body = {'model': row.get('model_id'), 'max_tokens': 1, 'messages': [{'role': 'user', 'content': 'hi'}]}
+            try:
+                headers['anthropic-version'] = (json.loads(row.get('extra_config') or '{}') or {}).get('anthropic_version', '2023-06-01')
+            except Exception:
+                headers['anthropic-version'] = '2023-06-01'
+            if key:
+                headers['x-api-key'] = key
+                headers.pop('Authorization', None)
+        elif et == 'responses':
+            url = base + '/responses'
+            body = {'model': row.get('model_id'), 'input': 'hi', 'max_output_tokens': 16}
+        else:
+            url = base + '/chat/completions'
+            body = {'model': row.get('model_id'), 'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 1, 'temperature': 0}
+        r = requests.post(url, headers=headers, json=body, timeout=tmo)
+        ms = round((time.time() - t0) * 1000)
+        if r.ok:
+            return True, ms, ''
+        return False, ms, 'HTTP %s %s' % (r.status_code, r.text[:150].replace(chr(10), ' '))
+    except Exception as e:
+        return False, round((time.time() - t0) * 1000), str(e)[:150]
+
+def start_probe_models(max_workers=None):
+    """后台线程逐个测速并写入 model_stats，返回 (ok, message)。"""
+    if PROBE_STATE.get('running'):
+        return False, '测速已在进行中（%d/%d），刷新页面可看进度' % (PROBE_STATE['done'], PROBE_STATE['total'])
+    targets = _probe_targets()
+    if not targets:
+        return False, '没有可测速的模型（已跳过本地 Ollama 与 OCR 端点）'
+    PROBE_STATE.update({'running': True, 'total': len(targets), 'done': 0, 'ok': 0, 'fail': 0,
+                        'started_at': time.strftime('%Y-%m-%d %H:%M:%S'), 'finished_at': '', 'last': []})
+
+    def worker():
+        conc = int(max_workers or os.environ.get('PROBE_CONCURRENCY', '4'))
+        try:
+            with ThreadPoolExecutor(max_workers=conc) as ex:
+                futs = {ex.submit(_probe_one, row): row for row in targets}
+                for f in as_completed(futs):
+                    row = futs[f]
+                    try:
+                        ok, ms, err = f.result()
+                    except Exception as e:
+                        ok, ms, err = False, 0, str(e)[:150]
+                    record_model_result(row['id'], ok, ms, err)
+                    PROBE_STATE['done'] += 1
+                    if ok:
+                        PROBE_STATE['ok'] += 1
+                    else:
+                        PROBE_STATE['fail'] += 1
+                    PROBE_STATE['last'] = (PROBE_STATE['last'] + [{'model': row.get('model_id'), 'upstream': row.get('name'), 'ok': ok, 'ms': ms}])[-8:]
+        except Exception as e:
+            print('[probe] worker crashed:', e)
+        finally:
+            PROBE_STATE['running'] = False
+            PROBE_STATE['finished_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            print('[probe] finished: %s ok / %s fail' % (PROBE_STATE['ok'], PROBE_STATE['fail']))
+
+    threading.Thread(target=worker, name='model-probe', daemon=True).start()
+    return True, '已在后台开始测速 %d 个模型（并发 %s），完成后 auto 会按实测速度排序' % (len(targets), os.environ.get('PROBE_CONCURRENCY', '4'))
+
 def candidate_model_rows(requested):
     rows=list(active_model_rows())
     if not rows: return []
-    def prefer_remote(row):
-        return 1 if row['provider_type']=='ollama' else 0
-    rows=sorted(rows, key=lambda r: (prefer_remote(r), 0 if r['is_default'] else 1, int(r['sort_order'] or 100), int(r['id'])))
     req=(requested or '').strip()
     if not req or req.lower() in ('auto','auto:fallback','fallback'):
-        return rows
+        return auto_sorted_rows(rows)   # auto：按实测响应速度排序
+    rows=sorted(rows, key=lambda r: (0 if r['provider_type']!='ollama' else 1, 0 if r['is_default'] else 1, int(r['sort_order'] or 100), int(r['id'])))
     exact=[]; rest=[]
     for r in rows:
         if req in (r['model_id'], r['display_name'], r['name']): exact.append(r)
@@ -1639,6 +1826,10 @@ def admin():
                 changed+=1
                 if len(caps['modalities'])>1: multi+=1
             con.commit(); msg=f'已重新识别 {changed} 个模型能力，其中疑似多模态 {multi} 个'
+        elif act=='probe_models':
+            _ok,_info=start_probe_models(); msg=_info
+        elif act=='reset_model_stats':
+            reset_model_stats(); msg='已清空全部速度统计，auto 将回到默认顺序（可重新测速）'
         elif act=='delete_model': con.execute('DELETE FROM model_providers WHERE id=?',(request.form.get('model_row_id'),)); con.commit(); msg='模型配置已删除'
     st=get_settings(); pay_missing=[]
     if st.get('payment_enabled')!='1': pay_missing.append('未启用')
@@ -1685,10 +1876,44 @@ def admin():
     bulk_html=''.join(_bulk) or '<tr><td colspan="7">暂无模型供应商</td></tr>'
     bulk_section=f'''<h3>按上游批量维护</h3><p class="muted">同一"上游名称"下的模型会被一起处理：换 Key、换 Base URL、批量启停、重命名、重排排序，不用再逐行点保存。</p>
 <table width="100%"><tr><th>上游</th><th>模型数</th><th>启用</th><th>默认</th><th>Base URL</th><th>Key</th><th>批量操作</th></tr>{bulk_html}</table>'''
+    # ---- 模型实测速度面板（auto 模式的排序依据）----
+    _srows=con.execute("SELECT p.id,p.name,p.model_id,p.provider_type,p.endpoint_type,COALESCE(s.ok_count,0) ok,COALESCE(s.fail_count,0) bad,COALESCE(s.avg_ms,0) avg,COALESCE(s.fail_streak,0) streak,s.last_error err FROM model_providers p LEFT JOIN model_stats s ON s.provider_id=p.id WHERE p.is_active=1").fetchall()
+    _tested=sorted([r for r in _srows if int(r['ok'] or 0)>0 and float(r['avg'] or 0)>0], key=lambda r: float(r['avg']))
+    fast_rows=''.join(f'<tr><td>{i}</td><td>{h(r["model_id"])}</td><td>{h(r["name"])}</td><td><b>{int(float(r["avg"]))} ms</b></td><td>{int(r["ok"])}/{int(r["bad"])}</td></tr>' for i,r in enumerate(_tested[:12],1)) or '<tr><td colspan="5" class="muted">还没有测速数据，点下方「开始测速」</td></tr>'
+    _agg={}
+    for r in _tested:
+        a=_agg.setdefault(r['name'],{'n':0,'sum':0.0,'min':1e9,'ok':0,'bad':0})
+        a['n']+=1; a['sum']+=float(r['avg']); a['min']=min(a['min'],float(r['avg'])); a['ok']+=int(r['ok'] or 0); a['bad']+=int(r['bad'] or 0)
+    up_rows=''.join(f'<tr><td>{h(nm)}</td><td>{a["n"]}</td><td>{int(a["sum"]/a["n"])} ms</td><td>{int(a["min"])} ms</td><td>{a["ok"]}/{a["bad"]}</td></tr>' for nm,a in sorted(_agg.items(), key=lambda kv: kv[1]['sum']/kv[1]['n'])) or '<tr><td colspan="5" class="muted">暂无数据</td></tr>'
+    _bad=[r for r in _srows if int(r['streak'] or 0)>=2 or (int(r['bad'] or 0)>0 and int(r['ok'] or 0)==0)]
+    bad_rows=''.join(f'<tr><td>{h(r["model_id"])}</td><td>{h(r["name"])}</td><td>{int(r["ok"] or 0)}/{int(r["bad"] or 0)}</td><td class="muted">{h((r["err"] or "")[:90])}</td></tr>' for r in _bad[:15]) or '<tr><td colspan="4" class="muted">暂无连续失败的模型</td></tr>'
+    ps=PROBE_STATE; prog=''
+    if ps.get('running'):
+        pct=int(100*ps['done']/ps['total']) if ps.get('total') else 0
+        prog=f'<p class="ok">测速进行中：{ps["done"]}/{ps["total"]}（成功 {ps["ok"]} · 失败 {ps["fail"]}），开始于 {h(ps["started_at"])}，刷新页面看进度</p><div style="height:8px;background:var(--line);border-radius:6px;overflow:hidden;margin:6px 0 10px"><div style="height:8px;width:{pct}%;background:linear-gradient(90deg,var(--primary),var(--primary2))"></div></div>'
+    elif ps.get('finished_at'):
+        prog=f'<p class="muted">上次测速：{h(ps["started_at"])} → {h(ps["finished_at"])}，共 {ps["total"]} 个（成功 {ps["ok"]} · 失败 {ps["fail"]}）</p>'
+    auto_pick=''
+    try:
+        _cand=auto_sorted_rows(active_model_rows()); _sm=model_stats_map()
+        if _cand:
+            _st=_sm.get(int(_cand[0]['id'])); _ms=int(float(_st['avg_ms'])) if (_st and _st['avg_ms']) else None
+            auto_pick=f'<p>当前 auto 首选：<b>{h(_cand[0]["model_id"])}</b>（{h(_cand[0]["name"])}{("，实测约 %d ms"%_ms) if _ms else "，暂无测速数据"}）· 排序方式 <code>{h(AUTO_SORT_MODE)}</code></p>'
+    except Exception: pass
+    probe_section=f'''<h3>模型测速 / auto 智能选路</h3>
+<p class="muted">「开始测速」会对所有启用的模型各发一次最小请求，记录真实响应耗时并写入统计。之后 <code>model:"auto"</code> 会<b>按实测速度优先挑最快的模型</b>；连续失败的自动排到最后，从没测过的给中性分（仍有机会被选中）。设 <code>AUTO_SORT_MODE=manual</code> 可改回手工排序，<code>AUTO_UNKNOWN_MS</code> / <code>AUTO_FAIL_PENALTY_MS</code> 可微调权重。</p>
+{auto_pick}{prog}
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin:8px 0 14px">
+<form method="post"><input type="hidden" name="act" value="probe_models"><button class="btn">开始测速（全部启用模型）</button></form>
+<form method="post"><input type="hidden" name="act" value="reset_model_stats"><button class="btn btn-danger">清空速度统计</button></form>
+</div>
+<div class="grid"><div><h4>最快的 12 个模型</h4><table width="100%"><tr><th>#</th><th>模型</th><th>上游</th><th>平均耗时</th><th>成功/失败</th></tr>{fast_rows}</table></div>
+<div><h4>上游平均耗时</h4><table width="100%"><tr><th>上游</th><th>已测模型</th><th>平均</th><th>最快</th><th>成功/失败</th></tr>{up_rows}</table></div></div>
+<h4>连续失败 / 从未成功的模型（建议在下方批量维护里禁用）</h4><table width="100%"><tr><th>模型</th><th>上游</th><th>成功/失败</th><th>最近错误</th></tr>{bad_rows}</table>'''
     body=f'''<div class="card"><h2>管理后台</h2>{'<p class="ok">'+h(msg)+'</p>' if msg else ''}
 <h3>易支付配置</h3><p>当前支付状态：{pay_status}</p><form method="post"><input type="hidden" name="act" value="save_epay"><div class="grid"><div><label>启用支付</label><select class="input" name="payment_enabled"><option value="0" {sel(st.get('payment_enabled'),'0')}>禁用/演示</option><option value="1" {sel(st.get('payment_enabled'),'1')}>启用</option></select></div><div><label>易支付网关</label><input class="input" name="epay_api_url" value="{h(st.get('epay_api_url',''))}" placeholder="https://epay.example.com"></div><div><label>商户 PID</label><input class="input" name="epay_pid" value="{h(st.get('epay_pid',''))}"></div><div><label>商户 Key</label><input class="input" name="epay_key" value="{h(st.get('epay_key',''))}"></div><div><label>域名</label><input class="input" name="domain" value="{h(st.get('domain',''))}"></div><div><label>公网 Base URL</label><input class="input" name="public_base_url" value="{h(st.get('public_base_url',''))}"></div></div><button class="btn">保存易支付配置</button></form>
 <h3>SMTP 邮件配置</h3><form method="post"><input type="hidden" name="act" value="save_smtp"><div class="grid"><div><label>启用 SMTP</label><select class="input" name="smtp_enabled"><option value="0" {sel(st.get('smtp_enabled'),'0')}>禁用</option><option value="1" {sel(st.get('smtp_enabled'),'1')}>启用</option></select></div><div><label>SMTP Host</label><input class="input" name="smtp_host" value="{h(st.get('smtp_host',''))}" placeholder="smtp.example.com"></div><div><label>端口</label><input class="input" name="smtp_port" value="{h(st.get('smtp_port','587'))}"></div><div><label>加密</label><select class="input" name="smtp_encryption"><option value="tls" {sel(st.get('smtp_encryption'),'tls')}>TLS/STARTTLS</option><option value="ssl" {sel(st.get('smtp_encryption'),'ssl')}>SSL</option><option value="none" {sel(st.get('smtp_encryption'),'none')}>不加密</option></select></div><div><label>账号</label><input class="input" name="smtp_username" value="{h(st.get('smtp_username',''))}"></div><div><label>密码/授权码</label><input class="input" name="smtp_password" value="{h(st.get('smtp_password',''))}"></div><div><label>发件邮箱</label><input class="input" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"></div><div><label>发件名称</label><input class="input" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"></div></div><button class="btn">保存 SMTP 配置</button></form><form method="post"><input type="hidden" name="act" value="test_smtp"><input type="hidden" name="smtp_enabled" value="{h(st.get('smtp_enabled','0'))}"><input type="hidden" name="smtp_host" value="{h(st.get('smtp_host',''))}"><input type="hidden" name="smtp_port" value="{h(st.get('smtp_port','587'))}"><input type="hidden" name="smtp_username" value="{h(st.get('smtp_username',''))}"><input type="hidden" name="smtp_password" value="{h(st.get('smtp_password',''))}"><input type="hidden" name="smtp_encryption" value="{h(st.get('smtp_encryption','tls'))}"><input type="hidden" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"><input type="hidden" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"><div class="grid"><div><label>测试收件邮箱</label><input class="input" name="test_email" value="{h(current_user()['email'] or '')}"></div></div><button class="btn btn2">发送测试邮件</button></form>
-{openai_compat_docs_html(st.get('public_base_url') or PUBLIC_BASE_URL)}{bulk_section}<h3>模型配置管理（三方 OpenAI 兼容/Ollama 中转）</h3><p class="muted">OpenAI 兼容供应商支持填写 Base URL + API Key 后自动请求 <code>/models</code> 批量导入模型 ID；多模态能力请按上游真实能力勾选，网关会据此做路由过滤。</p>{discover_form}<table width="100%"><tr><th>ID</th><th>名称/协议</th><th>类型</th><th>Base URL/扩展</th><th>API Key</th><th>模型ID/显示名</th><th>状态</th><th>能力</th><th>排序/超时/Token</th><th>操作</th></tr>{model_html}{new_model}</table>
+{openai_compat_docs_html(st.get('public_base_url') or PUBLIC_BASE_URL)}{bulk_section}{probe_section}<h3>模型配置管理（三方 OpenAI 兼容/Ollama 中转）</h3><p class="muted">OpenAI 兼容供应商支持填写 Base URL + API Key 后自动请求 <code>/models</code> 批量导入模型 ID；多模态能力请按上游真实能力勾选，网关会据此做路由过滤。</p>{discover_form}<table width="100%"><tr><th>ID</th><th>名称/协议</th><th>类型</th><th>Base URL/扩展</th><th>API Key</th><th>模型ID/显示名</th><th>状态</th><th>能力</th><th>排序/超时/Token</th><th>操作</th></tr>{model_html}{new_model}</table>
 <h3>套餐 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>价格</th><th>日额度</th><th>RPM</th><th>天数</th><th>状态</th><th>排序</th><th>说明</th><th>操作</th></tr>{plan_html}{new_plan}</table>
 <h3>管理项目 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>Slug</th><th>说明</th><th>链接</th><th>状态</th><th>排序</th><th>操作</th></tr>{proj_html}{new_proj}</table>
 <h3>用户 / 套餐 / 额度</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>套餐</th><th>自定义额度 / Key数</th><th>到期</th><th>余额</th><th>状态</th><th>今日已用</th><th>操作</th></tr>{uh}</table>
@@ -1763,9 +1988,13 @@ def run_gateway_request(payload, target_api='chat_completions'):
     if payload.get('stream'): candidates=candidates[:1]
     errors=[]
     for provider in candidates:
+        t_try=time.time()
         try:
-            return proxy_provider(provider,payload,key,input_tokens,start,target_api)
+            resp=proxy_provider(provider,payload,key,input_tokens,start,target_api)
+            record_model_result(provider['id'],True,round((time.time()-t_try)*1000))
+            return resp
         except Exception as e:
+            record_model_result(provider['id'],False,round((time.time()-t_try)*1000),str(e)[:200])
             errors.append({'provider':provider['name'],'model':provider['model_id'],'type':provider['provider_type'],'endpoint_type':get_provider_endpoint_type(provider),'error':str(e)[:500]})
             continue
     provider=candidates[0]
