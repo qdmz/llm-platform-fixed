@@ -30,7 +30,7 @@ ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@ypvps.com')
 SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
 # 构建标记：每次改完代码手动 +1，/healthz 与 /k 里能看到，用来确认"线上到底跑的是哪一版"
-BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-16.2320'
+BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-16.2350'
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 EPAY_API_URL = os.environ.get('EPAY_API_URL', '').rstrip('/')
 EPAY_PID = os.environ.get('EPAY_PID', '')
@@ -457,10 +457,25 @@ def start_upstream_seed_thread():
                 print('[init] upstream seeding finished in background')
             finally:
                 con.close()
-            # 重新部署会清空 SQLite（含速度统计），开启后每次启动自动重测一遍，
-            # auto 才能立刻按"谁快"排序；不影响端口监听（仍在后台线程里）。
-            if (os.environ.get('PROBE_ON_START') or '').strip().lower() in ('1','true','yes','on'):
-                _ok,_info=start_probe_models(); print('[init] PROBE_ON_START:', _info)
+            # 重新部署会清空 SQLite（含速度统计），auto 就失去了"谁快"的依据。
+            # 所以这里默认自动补测一遍（PROBE_ON_START=0/false/off 可关，=force 强制重测），
+            # 且只在统计表为空时才补，避免无谓地反复压上游；整个测速仍在后台线程，不阻塞端口监听。
+            _probe_env=(os.environ.get('PROBE_ON_START') or '').strip().lower()
+            if _probe_env in ('0','false','no','off'):
+                print('[init] PROBE_ON_START 已关闭，跳过启动测速')
+            else:
+                _has=0
+                try:
+                    _c=sqlite3.connect(DB_PATH, timeout=10)
+                    _has=int(_c.execute('SELECT COUNT(*) FROM model_stats').fetchone()[0] or 0); _c.close()
+                except Exception:
+                    _has=0
+                if _probe_env in ('force','always','1force'):
+                    _has=0
+                if _has:
+                    print('[init] model_stats 已有 %d 条记录，跳过启动测速' % _has)
+                else:
+                    _ok,_info=start_probe_models(); print('[init] PROBE_ON_START:', _info)
         except Exception as e:
             print('[init] upstream seeding failed (ignored):', e)
         finally:
@@ -1356,7 +1371,11 @@ _ENV_WATCH_PREFIXES = ('UPSTREAM_', 'AUTO_', 'PROBE_', 'PLAN_')
 _ENV_WATCH_EXACT = ('MASTER_API_KEY', 'STATIC_API_KEY', 'EXTRA_API_KEYS',
                     'ADMIN_USERNAME', 'ADMIN_EMAIL', 'ADMIN_PASSWORD', 'SITE_NAME',
                     'MODEL_NAME', 'OLLAMA_BASE_URL', 'EPAY_API_URL', 'EPAY_PID', 'EPAY_KEY',
-                    'SMTP_HOST', 'SMTP_USER', 'SMTP_FROM', 'MODELS_REQUIRE_AUTH', 'DEMO_FALLBACK')
+                    'SMTP_HOST', 'SMTP_USER', 'SMTP_FROM', 'MODELS_REQUIRE_AUTH', 'DEMO_FALLBACK',
+                    # 这些带前缀的变量"不存在"时也要报出来，所以必须显式列名（光靠前缀扫不到缺失项）
+                    'AUTO_SORT_MODE', 'AUTO_UNKNOWN_MS', 'AUTO_FAIL_PENALTY_MS',
+                    'AUTO_EXCLUDE_PATTERNS', 'AUTO_EXCLUDE_PENALTY', 'AUTO_TRY_TIMEOUT',
+                    'PROBE_ON_START', 'PROBE_CONCURRENCY', 'PROBE_TIMEOUT')
 
 
 @app.route('/envz')
