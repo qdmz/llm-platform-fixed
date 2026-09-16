@@ -70,6 +70,8 @@ Start: sh start.sh
 | `ADMIN_PASSWORD` | 必须改 |
 | `PUBLIC_BASE_URL` / `DOMAIN` | 平台分配的访问域名，用于邮件激活链接与支付回调 |
 | `DEMO_FALLBACK` | 设为 `1` 时，无可用上游模型也会返回演示回复，方便先验证部署 |
+| `MASTER_API_KEY` | 固定 API Key（**强烈建议**）：填一把自定的 `sk-...`，每次启动自动重建为 admin 名下永远有效的 Key，重新部署也不会失效 |
+| `AUTH_DEBUG` | 设为 `1` 时，401 响应会附带收到的 Key 候选（长度 + 哈希前缀），用于远程排查鉴权问题 |
 
 ### 用环境变量预置上游模型（强烈建议）
 
@@ -87,6 +89,31 @@ Start: sh start.sh
 
 也兼容 `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `UPSTREAM_MODEL`（单个模型）。
 建库时按 `模型ID + Base URL` 去重，重复部署不会产生重复记录。
+
+**多上游写法**：改用编号组 `UPSTREAM_1_BASE_URL` / `UPSTREAM_1_API_KEY` /
+`UPSTREAM_1_NAME` / `UPSTREAM_1_MODELS` / `UPSTREAM_1_FETCH_MODELS=1`，
+然后 `UPSTREAM_2_*`、`UPSTREAM_3_*`…（编号从 1 连续，最多 50 组）。
+`_FETCH_MODELS=1` 会在启动时自动 `GET {base}/models` 全量导入该上游的模型列表，
+条数上限用 `UPSTREAM_FETCH_MODELS_MAX`（默认 500）控制。
+
+### Authorization 头被反代丢弃时怎么调用（重要）
+
+部分平台链路（已实测：Cloudflare + 平台 ingress 的自定义域名）会**丢弃或改写
+`Authorization` 头**——同一把正确的 Key，用 `Authorization: Bearer` 调用 100% 返回
+401，改用自定义头调用立刻 200。这不是本站的 bug，客户端也基本无法自证。
+
+因此本服务支持 4 种传 Key 的方式，任选其一：
+
+| 方式 | 示例 | 适用 |
+| --- | --- | --- |
+| `Authorization` 头 | `Authorization: Bearer sk-xxx` | 标准写法；链路不吃头时可用 |
+| `X-API-Key` 头 | `X-API-Key: sk-xxx` | 可自定义头的客户端 / 脚本 |
+| 查询串 | `.../v1/chat/completions?api_key=sk-xxx` | 临时调试 |
+| **URL 路径（最通用）** | `https://host/k/sk-xxx/v1/chat/completions` | **只能填 Base URL 的客户端**（WorkBuddy 自定义模型、各类 OpenAI SDK） |
+
+路径写法只需把 Base URL 写成 `https://host/k/<你的 API Key>/v1`，Key 字段随便填——
+入口中间件会先把路径还原成 `/v1/...` 再交给 Flask 路由。已验证 openai-python 等
+OpenAI 兼容客户端可用。
 
 ## 部署后的自检
 

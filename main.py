@@ -83,9 +83,10 @@ def _ensure_secret_key():
 RUNTIME_HOME = _ensure_runtime_home()
 _ensure_secret_key()
 
-from gateway import app as flask_app, init_db  # noqa: E402  (env must be set first)
+from gateway import app as flask_app, init_db  # noqa: E402,F401  (env must be set first)
 
-init_db()
+# gateway.py already runs init_db() at import time; calling it again here would
+# re-seed and re-fetch every upstream model list twice on each boot.
 
 # ---------------------------------------------------------------- ASGI bridge
 class _ThreadedWSGIBridge:

@@ -44,6 +44,34 @@ app.secret_key = SECRET_KEY
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=False)
 CORS(app)
 
+class KeyPathMiddleware:
+    """把 /k/<api_key>/v1/... 改写为 /v1/...，并把 key 注入 X-API-Key。
+
+    背景：某些 PaaS / 反代链路（例如 Cloudflare + 平台 ingress 的自定义域名）
+    会丢弃或改写 Authorization 头，导致标准 OpenAI 客户端（只会设置
+    Authorization: Bearer <key>）永远 401。
+
+    把 key 放进 URL 路径即可绕开：
+        https://host/k/sk-xxxx/v1/chat/completions
+    对客户端来说只是个普通的 base_url，无需自定义头支持。
+    """
+    PREFIX = '/k/'
+
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        path = environ.get('PATH_INFO') or ''
+        if path.startswith(self.PREFIX):
+            rest = path[len(self.PREFIX):]
+            key, sep, tail = rest.partition('/')
+            if key:
+                environ['HTTP_X_API_KEY'] = key
+                environ['PATH_INFO'] = ('/' + tail) if sep else '/'
+        return self.wsgi_app(environ, start_response)
+
+app.wsgi_app = KeyPathMiddleware(app.wsgi_app)
+
 @app.after_request
 def no_cache_dynamic_pages(resp):
     if request.path in ['/', '/login', '/register', '/logout', '/dashboard', '/playground', '/admin'] or request.path.startswith('/ticket/') or request.path.startswith('/pay/'):
@@ -131,7 +159,29 @@ CREATE TABLE IF NOT EXISTS email_activations(id INTEGER PRIMARY KEY AUTOINCREMEN
         c.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order) VALUES(?,?,?,?,?,?,?,?,?)', ('本地 Ollama','ollama',OLLAMA_BASE_URL,'',MODEL_NAME,MODEL_NAME,1,1,10))
     seed_upstream_from_env(c)
     c.execute('INSERT OR IGNORE INTO users(username,email,password_hash,is_admin,invite_code,tokens_reset_date) VALUES(?,?,?,?,?,?)', ('admin','admin@example.com',generate_password_hash(ADMIN_PASSWORD),1,secrets.token_hex(6).upper(),dt.date.today().isoformat()))
+    seed_master_api_key(c)
     con.commit(); con.close()
+
+def seed_master_api_key(c):
+    """把 MASTER_API_KEY 环境变量播种成一把"永远有效"的 API Key（归属 admin）。
+
+    用途：PaaS/沙箱的容器盘是临时的，重新部署会重建 SQLite，后台手工创建的
+    用户和 API Key 全部失效。把 Key 写进环境变量后每次启动自动重建同一把，
+    客户端（WorkBuddy、脚本、第三方 SDK）配置就不必跟着改。
+    不设置该变量时本函数不做任何事。
+    """
+    raw=(os.environ.get('MASTER_API_KEY') or os.environ.get('STATIC_API_KEY') or '').strip()
+    if not raw: return
+    admin=c.execute('SELECT id FROM users WHERE is_admin=1 ORDER BY id ASC LIMIT 1').fetchone()
+    if not admin: return
+    uid=admin['id']
+    key_hash=hashlib.sha256(raw.encode()).hexdigest()
+    row=c.execute('SELECT id FROM api_keys WHERE key_hash=?',(key_hash,)).fetchone()
+    if row:
+        c.execute('UPDATE api_keys SET is_active=1,key_plain=?,user_id=? WHERE id=?',(raw,uid,row['id']))
+    else:
+        c.execute('INSERT INTO api_keys(user_id,key_hash,key_prefix,key_plain,name,rate_limit) VALUES(?,?,?,?,?,?)',(uid,key_hash,raw[:10],raw,'MASTER_API_KEY (env)',100000))
+    print('[init] MASTER_API_KEY seeded as an always-valid admin API key')
 
 def seed_upstream_from_env(c):
     """按环境变量预置第三方上游模型。
@@ -366,21 +416,43 @@ def token_count(messages):
         else: total_chars += len(str(content or ''))
     return total_chars//2+1
 
+def _bearer_stripped(value):
+    value=(value or '').strip()
+    if value[:7].lower()=='bearer ': value=value[7:].strip()
+    return value
+
+def api_key_candidates():
+    """按优先级收集本次请求可能携带 API Key 的位置。
+
+    线上实测（Cloudflare + 平台 ingress 的自定义域名）：Authorization 头会被
+    丢弃或改写 —— 同一把 Key 用 Authorization 100% 401，改用 X-API-Key 立刻 200。
+    因此把可能的来源都收集起来逐个比对，任一命中即通过。
+    """
+    cands=[]
+    auth=(request.headers.get('Authorization') or '').strip()
+    if auth: cands.append(_bearer_stripped(auth))
+    # 自定义头（Authorization 被中间层动过时最先命中这里）
+    for name in ('X-API-Key','api-key','x-api-key','x-auth-token','x-api-token','X-Authorization'):
+        v=(request.headers.get(name) or '').strip()
+        if v: cands.append(_bearer_stripped(v))
+    # 查询串：?api_key= / ?key= / ?access_token=
+    for q in ('api_key','key','access_token'):
+        v=(request.args.get(q) or '').strip()
+        if v: cands.append(_bearer_stripped(v))
+    seen=set(); out=[]
+    for c in cands:
+        if c and c not in seen:
+            seen.add(c); out.append(c)
+    return out
+
 def api_auth():
-    auth=request.headers.get('Authorization','')
-    raw=''
-    if auth.startswith('Bearer '): raw=auth.split(' ',1)[1].strip()
-    if not raw:
-        # 部分反代/网关会改写 Authorization 头，提供 X-API-Key 作为替代
-        raw=(request.headers.get('X-API-Key') or '').strip()
-    if not raw: return None,None
-    key_hash=hashlib.sha256(raw.encode()).hexdigest()
-    row=db().execute('SELECT k.*,u.plan,u.tokens_used_today,u.tokens_reset_date,u.is_active user_active,u.daily_token_limit,u.custom_rate_limit FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=? AND k.is_active=1',(key_hash,)).fetchone()
-    if not row or not row['user_active']:
+    for raw in api_key_candidates():
+        key_hash=hashlib.sha256(raw.encode()).hexdigest()
+        row=db().execute('SELECT k.*,u.plan,u.tokens_used_today,u.tokens_reset_date,u.is_active user_active,u.daily_token_limit,u.custom_rate_limit FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=? AND k.is_active=1',(key_hash,)).fetchone()
+        if row and row['user_active']: return row,raw
         if os.environ.get('AUTH_DEBUG'):
             app.logger.warning('AUTH_DEBUG miss: recv_len=%s recv_sha256=%s', len(raw), key_hash)
-        return None,None
-    return row,raw
+    return None,None
 
 def epay_sign(params):
     filtered={k:v for k,v in params.items() if k not in ('sign','sign_type') and v not in ('',None)}
@@ -885,6 +957,9 @@ def usage_guide_html(sample_key):
     base_v1=public_base_url()+'/v1'
     return f'''<div class="card"><h3>使用方法（OpenAI 兼容接口）</h3>
 <p>接口地址：<b>{h(base_v1)}</b><br>认证方式：请求头 <code>Authorization: Bearer &lt;你的 API Key&gt;</code></p>
+<p class="muted"><b>如果 Authorization 头被中间的 CDN/网关丢弃（表现为一直 401，而 Key 本身没错）</b>，把 Key 放进 URL 路径即可，无需自定义头：<br>
+<code>{h(public_base_url())}/k/&lt;你的 API Key&gt;/v1</code> —— 把这个当地址填，Key 随便填。<br>
+也支持自定义头 <code>X-API-Key</code> 与查询串 <code>?api_key=&lt;key&gt;</code>。</p>
 <table><tr><th>端点</th><th>方法</th><th>说明</th></tr>
 <tr><td><code>/v1/models</code></td><td>GET</td><td>列出当前可用模型</td></tr>
 <tr><td><code>/v1/chat/completions</code></td><td>POST</td><td>对话补全，支持 <code>stream: true</code> 流式</td></tr>
@@ -893,6 +968,9 @@ def usage_guide_html(sample_key):
 <p class="muted"><code>model</code> 填 <code>auto</code> 会自动路由（第三方优先、本地兜底），也可以直接填下方模型列表里的模型 ID。</p>
 <h4>curl</h4><pre>curl {h(base_v1)}/chat/completions \\
   -H "Authorization: Bearer {h(sample_key)}" \\
+  -H "Content-Type: application/json" \\
+  -d '{{"model":"auto","messages":[{{"role":"user","content":"你好"}}]}}'</pre>
+<h4>curl —— Key 写在路径里（Authorization 被中间层吃掉时用这个）</h4><pre>curl {h(public_base_url())}/k/{h(sample_key)}/v1/chat/completions \\
   -H "Content-Type: application/json" \\
   -d '{{"model":"auto","messages":[{{"role":"user","content":"你好"}}]}}'</pre>
 <h4>Python（openai SDK）</h4><pre>from openai import OpenAI
@@ -1183,10 +1261,9 @@ def run_gateway_request(payload, target_api='chat_completions'):
     if not key:
         body={'error':{'message':'Unauthorized: missing/invalid Bearer API key','type':'auth_error'}}
         if os.environ.get('AUTH_DEBUG'):
-            recv=request.headers.get('Authorization','')
-            if recv.startswith('Bearer '): recv=recv[7:].strip()
-            elif not recv: recv=request.headers.get('X-API-Key','')
-            body['error']['auth_debug']={'recv_len':len(recv),'recv_sha256':hashlib.sha256(recv.encode()).hexdigest() if recv else '(header missing)'}
+            cands=api_key_candidates()
+            dbg=[{'sha256':hashlib.sha256(c.encode()).hexdigest()[:16],'len':len(c)} for c in cands]
+            body['error']['auth_debug']={'candidates':dbg or '(no api key found in Authorization / X-API-Key / query)'}
         return jsonify(body),401
     messages=payload.get('messages') if 'messages' in payload else responses_input_to_chat_messages(payload.get('input',''))
     input_tokens=token_count(messages)
