@@ -29,6 +29,8 @@ ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@ypvps.com')
 SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
+# 构建标记：每次改完代码手动 +1，/healthz 与 /k 里能看到，用来确认"线上到底跑的是哪一版"
+BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-16.2230'
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 EPAY_API_URL = os.environ.get('EPAY_API_URL', '').rstrip('/')
 EPAY_PID = os.environ.get('EPAY_PID', '')
@@ -797,6 +799,18 @@ AUTO_SORT_MODE = (os.environ.get('AUTO_SORT_MODE', 'speed') or 'speed').strip().
 # 专用/非通用对话模型（翻译、安全审查、向量、解析等）虽然很快，但不适合做 auto 首选，降权处理
 AUTO_EXCLUDE_PATTERNS = [p.strip().lower() for p in (os.environ.get('AUTO_EXCLUDE_PATTERNS') or 'embed,rerank,guard,safety,translate,detector,moderation,parse').split(',') if p.strip()]
 AUTO_EXCLUDE_PENALTY = float(os.environ.get('AUTO_EXCLUDE_PENALTY', '100000'))
+# auto 模式下单个候选的尝试上限：最慢排第一也就是等这么久就换下一个，避免一次请求被慢模型拖到几十秒
+AUTO_TRY_TIMEOUT = int(os.environ.get('AUTO_TRY_TIMEOUT', '25') or 25)
+_TRY_CTX = threading.local()
+
+def _try_timeout(provider, default=300):
+    """auto 模式下给单个候选的网络超时加一个上限；非 auto 用条目自身的 timeout_seconds。"""
+    try:
+        base = int(provider['timeout_seconds'] or default)
+    except Exception:
+        base = default
+    cap = int(getattr(_TRY_CTX, 'cap', 0) or 0)
+    return min(base, cap) if cap else base
 
 def _auto_excluded(model_id):
     mid = (model_id or '').lower()
@@ -1186,7 +1200,7 @@ def proxy_chat_completions_provider(provider, payload, key, input_tokens, start,
     if 'messages' not in out and 'input' in out:
         out['messages']=responses_input_to_chat_messages(out.get('input'))
     out.pop('input', None)
-    r=requests.post(url+'/chat/completions',headers=headers,json=out,timeout=int(provider['timeout_seconds'] or 300),stream=bool(out.get('stream')))
+    r=requests.post(url+'/chat/completions',headers=headers,json=out,timeout=_try_timeout(provider),stream=bool(out.get('stream')))
     if not r.ok: raise RuntimeError(f"{provider['name']} upstream HTTP {r.status_code}: {r.text[:500]}")
     if out.get('stream'):
         def gen():
@@ -1236,7 +1250,7 @@ def proxy_responses_provider(provider, payload, key, input_tokens, start, target
     if 'input' not in out and 'messages' in out:
         out['input']=chat_messages_to_responses_input(out.get('messages') or [])
     out.pop('messages',None)
-    r=requests.post(url+'/responses',headers=headers,json=out,timeout=int(provider['timeout_seconds'] or 300),stream=bool(out.get('stream')))
+    r=requests.post(url+'/responses',headers=headers,json=out,timeout=_try_timeout(provider),stream=bool(out.get('stream')))
     if not r.ok: raise RuntimeError(f"{provider['name']} upstream HTTP {r.status_code}: {r.text[:500]}")
     if out.get('stream'):
         return proxy_responses_stream(r,provider,target_api)
@@ -1266,7 +1280,7 @@ def proxy_anthropic_messages_provider(provider, payload, key, input_tokens, star
     if 'messages' not in out and 'input' in out:
         out['messages']=responses_input_to_chat_messages(out.get('input'))
     if 'max_tokens' not in out: out['max_tokens']=int(provider['max_output_tokens'] or 1024) if 'max_output_tokens' in provider.keys() else 1024
-    r=requests.post(url+'/messages',headers=headers,json=out,timeout=int(provider['timeout_seconds'] or 300),stream=bool(out.get('stream')))
+    r=requests.post(url+'/messages',headers=headers,json=out,timeout=_try_timeout(provider),stream=bool(out.get('stream')))
     if not r.ok: raise RuntimeError(f"{provider['name']} upstream HTTP {r.status_code}: {r.text[:500]}")
     if out.get('stream'):
         def gen():
@@ -1290,7 +1304,7 @@ def proxy_ollama_as_response(provider, payload, key, input_tokens, start):
     base=(provider['base_url'] or OLLAMA_BASE_URL).rstrip('/'); model=provider['model_id'] or MODEL_NAME
     model_latest=model if model.endswith(':latest') or ':' in model else model+':latest'
     prompt='\n'.join([str(m.get('role','user'))+': '+content_text(m.get('content','')) for m in payload2.get('messages') or []])
-    r=requests.post(base+'/api/generate',json={'model':model_latest,'prompt':prompt,'stream':False,'options':{'temperature':payload.get('temperature',0.7)}},timeout=int(provider['timeout_seconds'] or 300))
+    r=requests.post(base+'/api/generate',json={'model':model_latest,'prompt':prompt,'stream':False,'options':{'temperature':payload.get('temperature',0.7)}},timeout=_try_timeout(provider))
     if not r.ok: raise RuntimeError(r.text)
     obj=r.json(); content=obj.get('response',''); out_tokens=max(1,len(content)//2)
     record_usage(key,input_tokens,out_tokens,model,'/v1/responses',start)
@@ -1311,7 +1325,7 @@ def proxy_ollama(provider, payload, key, input_tokens, start):
     base=(provider['base_url'] or OLLAMA_BASE_URL).rstrip('/'); model=provider['model_id'] or MODEL_NAME
     if not model.endswith(':latest') and ':' not in model: model_latest=model+':latest'
     else: model_latest=model
-    stream=bool(payload.get('stream',False)); timeout=int(provider['timeout_seconds'] or 300)
+    stream=bool(payload.get('stream',False)); timeout=_try_timeout(provider)
     prompt='\n'.join([str(m.get('role','user'))+': '+str(m.get('content','')) for m in messages]) or str(payload.get('prompt',''))
     # Ollama 的部分 GGUF 模型只标记 completion，/api/generate 比 /api/chat 更稳更快；统一用 generate 再包装成 OpenAI 响应。
     r=requests.post(base+'/api/generate',json={'model':model_latest,'prompt':prompt,'stream':stream,'options':{'temperature':payload.get('temperature',0.7)}},timeout=timeout,stream=stream)
@@ -1334,7 +1348,7 @@ def proxy_ollama(provider, payload, key, input_tokens, start):
 @app.route('/healthz')
 def healthz():
     """轻量健康检查：不做任何外部网络请求，保证平台探针秒回 200。"""
-    return jsonify({'ok': True, 'service': 'llm-platform'})
+    return jsonify({'ok': True, 'service': 'llm-platform', 'build': BUILD_TAG})
 
 _OLLAMA_PROBE={'ok':None}
 def _ollama_probe_loop():
@@ -1947,7 +1961,7 @@ def health():
 @app.route('/k',methods=['GET','POST'])
 def key_path_helper():
     """直接访问 /k/<key>（URL 里没带端点路径）时的提示。"""
-    info={'ok':True,
+    info={'ok':True,'build':BUILD_TAG,
         'why':'部分 CDN / 反代会丢弃 Authorization 头，把 API Key 放进 URL 路径即可绕过',
         'base_url_examples':['https://<host>/k/<API_KEY>/v1','https://<host>/k/<API_KEY>'],
         'endpoints':['/k/<API_KEY>/v1/chat/completions','/k/<API_KEY>/v1/models','/k/<API_KEY>/v1/responses','/k/<API_KEY>/v1/messages'],
@@ -2001,6 +2015,9 @@ def run_gateway_request(payload, target_api='chat_completions'):
     errors=[]
     _req=(requested or '').strip().lower()
     auto_mode=(not _req) or _req in ('auto','auto:fallback','fallback')
+    # auto：单个候选最多等 AUTO_TRY_TIMEOUT 秒，超时就换下一个候选（并记一次失败让该模型降权），
+    # 免得排第一的慢模型把整次请求拖到几十秒。显式指定模型时不加这个上限。
+    _TRY_CTX.cap = AUTO_TRY_TIMEOUT if auto_mode else 0
     for provider in candidates:
         t_try=time.time()
         try:
