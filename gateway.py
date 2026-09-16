@@ -30,7 +30,7 @@ ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@ypvps.com')
 SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
 # 构建标记：每次改完代码手动 +1，/healthz 与 /k 里能看到，用来确认"线上到底跑的是哪一版"
-BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-16.2230'
+BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-16.2320'
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 EPAY_API_URL = os.environ.get('EPAY_API_URL', '').rstrip('/')
 EPAY_PID = os.environ.get('EPAY_PID', '')
@@ -1349,6 +1349,51 @@ def proxy_ollama(provider, payload, key, input_tokens, start):
 def healthz():
     """轻量健康检查：不做任何外部网络请求，保证平台探针秒回 200。"""
     return jsonify({'ok': True, 'service': 'llm-platform', 'build': BUILD_TAG})
+
+# 环境变量自检：只输出"变量名是否存在 + 长度 + sha256 前 8 位"，绝不回显任何密钥原文。
+# 用途：平台上的变量是 source 进容器的，用户常常以为加了其实没生效，靠这个一眼定位。
+_ENV_WATCH_PREFIXES = ('UPSTREAM_', 'AUTO_', 'PROBE_', 'PLAN_')
+_ENV_WATCH_EXACT = ('MASTER_API_KEY', 'STATIC_API_KEY', 'EXTRA_API_KEYS',
+                    'ADMIN_USERNAME', 'ADMIN_EMAIL', 'ADMIN_PASSWORD', 'SITE_NAME',
+                    'MODEL_NAME', 'OLLAMA_BASE_URL', 'EPAY_API_URL', 'EPAY_PID', 'EPAY_KEY',
+                    'SMTP_HOST', 'SMTP_USER', 'SMTP_FROM', 'MODELS_REQUIRE_AUTH', 'DEMO_FALLBACK')
+
+
+@app.route('/envz')
+def envz():
+    """查看本次进程实际拿到的环境变量（只列名 + 指纹，不回显值）。需要一把有效 Key。"""
+    key, _ = api_auth()
+    if not key:
+        return jsonify({'error': {'message': 'Unauthorized: /envz 需要有效 API Key', 'type': 'auth_error'}}), 401
+    present, missing = {}, []
+    names = set(_ENV_WATCH_EXACT)
+    for k in os.environ:
+        if any(k.startswith(p) for p in _ENV_WATCH_PREFIXES):
+            names.add(k)
+    for name in sorted(names):
+        v = os.environ.get(name)
+        if v is None or v == '':
+            missing.append(name)
+            continue
+        present[name] = {'len': len(v), 'sha256_8': hashlib.sha256(v.encode()).hexdigest()[:8]}
+        # 逗号/换行分隔的多值变量（如 EXTRA_API_KEYS）：逐项列指纹，方便核对是哪一把 Key
+        if name.endswith('_API_KEYS'):
+            parts = [p.strip() for p in re.split(r'[,\n;]+', v) if p.strip()]
+            present[name]['count'] = len(parts)
+            present[name]['items'] = [{'len': len(p), 'sha256_8': hashlib.sha256(p.encode()).hexdigest()[:8]} for p in parts]
+    # 数据库里现在到底有哪些 Key（同样只给指纹），和设备上的 Key 对账
+    try:
+        keys = [{'name': r['name'], 'key_prefix': r['key_prefix'], 'user_id': r['user_id'],
+                 'sha256_8': (r['key_hash'] or '')[:8]} for r in
+                db().execute('SELECT name,key_prefix,user_id,key_hash FROM api_keys ORDER BY id ASC').fetchall()]
+    except Exception as e:
+        keys = ['(读取失败: %s)' % e]
+    return jsonify({'ok': True, 'build': BUILD_TAG,
+                    'env_present': present, 'env_missing_or_empty': missing,
+                    'db_api_keys': keys,
+                    'hint': '拿客户端里的 Key 做 sha256 取前 8 位，跟 db_api_keys 的 sha256_8 比对；'
+                            '对不上就是这把 Key 被重新部署清掉了（容器盘临时）。'
+                            '解决办法：改用 MASTER_API_KEY，或把该 Key 写进 EXTRA_API_KEYS 环境变量。'})
 
 _OLLAMA_PROBE={'ok':None}
 def _ollama_probe_loop():
