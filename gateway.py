@@ -129,8 +129,35 @@ CREATE TABLE IF NOT EXISTS email_activations(id INTEGER PRIMARY KEY AUTOINCREMEN
     c.execute('DELETE FROM model_providers WHERE id NOT IN (SELECT MIN(id) FROM model_providers GROUP BY provider_type, model_id, base_url)')
     if not c.execute('SELECT 1 FROM model_providers WHERE provider_type=? AND model_id=? AND base_url=?',('ollama',MODEL_NAME,OLLAMA_BASE_URL)).fetchone():
         c.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order) VALUES(?,?,?,?,?,?,?,?,?)', ('本地 Ollama','ollama',OLLAMA_BASE_URL,'',MODEL_NAME,MODEL_NAME,1,1,10))
+    seed_upstream_from_env(c)
     c.execute('INSERT OR IGNORE INTO users(username,email,password_hash,is_admin,invite_code,tokens_reset_date) VALUES(?,?,?,?,?,?)', ('admin','admin@example.com',generate_password_hash(ADMIN_PASSWORD),1,secrets.token_hex(6).upper(),dt.date.today().isoformat()))
     con.commit(); con.close()
+
+def seed_upstream_from_env(c):
+    """按环境变量预置第三方上游模型。
+
+    PaaS/沙箱的容器盘是临时的：每次重新部署都会重建 SQLite，
+    后台 /admin 里手工添加的模型供应商会被清空（表现为重新部署后
+    所有请求又变成 502）。这里让上游配置也能来自环境变量，
+    因为环境变量在平台上是被持久保存的。
+
+    UPSTREAM_BASE_URL   必填，OpenAI 兼容 Base URL，如 https://api.deepseek.com/v1
+    UPSTREAM_API_KEY    上游 API Key
+    UPSTREAM_MODELS     模型 ID 列表，逗号或换行分隔；留空则用 MODEL_NAME
+    UPSTREAM_NAME       后台显示名称，默认 "env 上游模型"
+    UPSTREAM_IS_DEFAULT 是否为默认模型，默认 1
+    """
+    base=(os.environ.get('UPSTREAM_BASE_URL') or os.environ.get('OPENAI_BASE_URL') or '').strip().rstrip('/')
+    if not base: return
+    key=(os.environ.get('UPSTREAM_API_KEY') or os.environ.get('OPENAI_API_KEY') or '').strip()
+    name=(os.environ.get('UPSTREAM_NAME') or 'env 上游模型').strip() or 'env 上游模型'
+    raw=(os.environ.get('UPSTREAM_MODELS') or os.environ.get('UPSTREAM_MODEL') or '').replace('\n',',')
+    models=[m.strip() for m in raw.split(',') if m.strip()] or [MODEL_NAME]
+    is_default=0 if (os.environ.get('UPSTREAM_IS_DEFAULT','1').strip().lower() in ('0','false','no','off')) else 1
+    for idx, mid in enumerate(models):
+        if c.execute('SELECT 1 FROM model_providers WHERE model_id=? AND base_url=?', (mid, base)).fetchone(): continue
+        c.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds,endpoint_type,modalities,supports_stream,supports_tools) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (name,'openai',base,key,mid,mid,is_default if idx==0 else 0,1,20+idx,'300','chat_completions','["text"]',1,0))
 
 def current_user():
     uid=session.get('uid')

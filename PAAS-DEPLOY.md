@@ -71,6 +71,23 @@ Start: sh start.sh
 | `PUBLIC_BASE_URL` / `DOMAIN` | 平台分配的访问域名，用于邮件激活链接与支付回调 |
 | `DEMO_FALLBACK` | 设为 `1` 时，无可用上游模型也会返回演示回复，方便先验证部署 |
 
+### 用环境变量预置上游模型（强烈建议）
+
+沙箱每次重新部署都会重建 SQLite，**在 `/admin` 里手工添加的模型供应商会被清空**
+（表现：重新部署后所有对话请求又变成 502）。把上游写进环境变量可以避免这个问题，
+因为环境变量由平台持久保存：
+
+| 变量 | 说明 |
+| --- | --- |
+| `UPSTREAM_BASE_URL` | 必填，OpenAI 兼容 Base URL，例如 `https://api.deepseek.com/v1`（结尾斜杠会自动去掉） |
+| `UPSTREAM_API_KEY` | 上游 API Key |
+| `UPSTREAM_MODELS` | 模型 ID 列表，逗号或换行分隔，例如 `deepseek-chat,deepseek-reasoner`；留空则用 `MODEL_NAME` |
+| `UPSTREAM_NAME` | 可选，后台显示名称，默认 `env 上游模型` |
+| `UPSTREAM_IS_DEFAULT` | 可选，是否设为默认模型，默认 `1`；设 `0` 则只注册不置顶 |
+
+也兼容 `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `UPSTREAM_MODEL`（单个模型）。
+建库时按 `模型ID + Base URL` 去重，重复部署不会产生重复记录。
+
 ## 部署后的自检
 
 ```bash
@@ -112,6 +129,11 @@ R2 操作：Dashboard → R2 → Create bucket → API Tokens（Object Read & Wr
 ### 其它
 
 * 沙箱内没有本地 Ollama，`/health` 的 `ollama` 会是 `false`。
-  请在 `/admin` 里配置一个 OpenAI 兼容的第三方上游，或设 `DEMO_FALLBACK=1` 先跑通流程。
+  请在 `/admin` 里配置一个 OpenAI 兼容的第三方上游（或按上文用
+  `UPSTREAM_BASE_URL` 等环境变量预置），也可设 `DEMO_FALLBACK=1` 先跑通流程。
+* 普通用户登录后可在「用户控制台」看到接入说明（curl / Python / Node 示例）
+  与可用模型列表；管理员在首页还能看到接口地址速查卡片。
+* 对话接口返回 `401` = API Key 错误；返回 `502` = 所有上游模型都调用失败
+  （通常是上游 Base URL / Key 配错，或没有启用任何上游）。
 * 建议把 `ADMIN_PASSWORD`、`FLASK_SECRET_KEY`、`PUBLIC_BASE_URL` 放在平台的环境变量里，
   不要提交 `.env`。
