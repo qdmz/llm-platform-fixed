@@ -33,3 +33,13 @@ ck*.txt
 dash*.html
 home*.html
 uv*.log
+
+# local test artifacts
+adm*.txt
+adm_*.html
+rot.html
+rc.json
+nk*.html
+lresp.json
+wk.html
+wt.log

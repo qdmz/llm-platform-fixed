@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS email_activations(id INTEGER PRIMARY KEY AUTOINCREMEN
     ]:
         try: c.execute(ddl)
         except sqlite3.OperationalError: pass
-    for k,v in {'epay_api_url': EPAY_API_URL, 'epay_pid': EPAY_PID, 'epay_key': EPAY_KEY, 'domain': DOMAIN, 'public_base_url': PUBLIC_BASE_URL, 'payment_enabled': '0' if not (EPAY_API_URL and EPAY_PID and EPAY_KEY) else '1', 'smtp_enabled': '0', 'smtp_host': '', 'smtp_port': '587', 'smtp_username': '', 'smtp_password': '', 'smtp_encryption': 'tls', 'smtp_from_email': '', 'smtp_from_name': 'LLM Platform'}.items():
+    for k,v in {'epay_api_url': EPAY_API_URL, 'epay_pid': EPAY_PID, 'epay_key': EPAY_KEY, 'domain': DOMAIN, 'public_base_url': PUBLIC_BASE_URL, 'payment_enabled': '0' if not (EPAY_API_URL and EPAY_PID and EPAY_KEY) else '1', 'smtp_enabled': os.environ.get('SMTP_ENABLED','0'), 'smtp_host': os.environ.get('SMTP_HOST',''), 'smtp_port': os.environ.get('SMTP_PORT','587'), 'smtp_username': os.environ.get('SMTP_USERNAME',''), 'smtp_password': os.environ.get('SMTP_PASSWORD',''), 'smtp_encryption': os.environ.get('SMTP_ENCRYPTION','tls'), 'smtp_from_email': os.environ.get('SMTP_FROM_EMAIL',''), 'smtp_from_name': os.environ.get('SMTP_FROM_NAME','LLM Platform')}.items():
         c.execute('INSERT OR IGNORE INTO app_settings(key,value) VALUES(?,?)', (k, v or ''))
     for idx,(pid,cfg) in enumerate(PLAN_CONFIG.items()):
         c.execute('INSERT OR IGNORE INTO plans(id,name,price,daily_tokens,rate_limit,days,is_active,sort_order,description) VALUES(?,?,?,?,?,?,?,?,?)', (pid,cfg['name'],cfg['price'],cfg['daily_tokens'],cfg['rate_limit'],cfg['days'],1,idx*10,cfg.get('description','')))
@@ -141,23 +141,53 @@ def seed_upstream_from_env(c):
     所有请求又变成 502）。这里让上游配置也能来自环境变量，
     因为环境变量在平台上是被持久保存的。
 
-    UPSTREAM_BASE_URL   必填，OpenAI 兼容 Base URL，如 https://api.deepseek.com/v1
-    UPSTREAM_API_KEY    上游 API Key
-    UPSTREAM_MODELS     模型 ID 列表，逗号或换行分隔；留空则用 MODEL_NAME
-    UPSTREAM_NAME       后台显示名称，默认 "env 上游模型"
-    UPSTREAM_IS_DEFAULT 是否为默认模型，默认 1
+    支持两种写法：
+    1) 单上游（简写）：UPSTREAM_BASE_URL / UPSTREAM_API_KEY / UPSTREAM_NAME /
+       UPSTREAM_MODELS / UPSTREAM_FETCH_MODELS / UPSTREAM_IS_DEFAULT
+    2) 多上游（编号）：UPSTREAM_1_BASE_URL、UPSTREAM_2_BASE_URL ... 每个编号
+       都支持对应的 _API_KEY / _NAME / _MODELS / _FETCH_MODELS / _IS_DEFAULT 后缀。
+       编号从 1 连续编号，遇到缺失的编号即停止。
+
+    UPSTREAM_FETCH_MODELS=1 时启动时自动 GET {base}/models 全量导入
+    （等价于后台的"自动发现"），可用 UPSTREAM_FETCH_MODELS_MAX 限制条数（默认 500）。
+    兼容 OPENAI_BASE_URL / OPENAI_API_KEY / UPSTREAM_MODEL（单个模型）。
+    建库时按 `模型ID + Base URL` 去重，重复部署不会产生重复记录。
     """
-    base=(os.environ.get('UPSTREAM_BASE_URL') or os.environ.get('OPENAI_BASE_URL') or '').strip().rstrip('/')
-    if not base: return
-    key=(os.environ.get('UPSTREAM_API_KEY') or os.environ.get('OPENAI_API_KEY') or '').strip()
-    name=(os.environ.get('UPSTREAM_NAME') or 'env 上游模型').strip() or 'env 上游模型'
-    raw=(os.environ.get('UPSTREAM_MODELS') or os.environ.get('UPSTREAM_MODEL') or '').replace('\n',',')
-    models=[m.strip() for m in raw.split(',') if m.strip()] or [MODEL_NAME]
-    is_default=0 if (os.environ.get('UPSTREAM_IS_DEFAULT','1').strip().lower() in ('0','false','no','off')) else 1
-    for idx, mid in enumerate(models):
-        if c.execute('SELECT 1 FROM model_providers WHERE model_id=? AND base_url=?', (mid, base)).fetchone(): continue
-        c.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds,endpoint_type,modalities,supports_stream,supports_tools) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-            (name,'openai',base,key,mid,mid,is_default if idx==0 else 0,1,20+idx,'300','chat_completions','["text"]',1,0))
+    groups=[]
+    base=(os.environ.get('UPSTREAM_BASE_URL') or os.environ.get('OPENAI_BASE_URL') or '').strip()
+    if base:
+        groups.append({'base':base,'key':(os.environ.get('UPSTREAM_API_KEY') or os.environ.get('OPENAI_API_KEY') or '').strip(),
+            'name':(os.environ.get('UPSTREAM_NAME') or 'env 上游模型').strip() or 'env 上游模型',
+            'models':(os.environ.get('UPSTREAM_MODELS') or os.environ.get('UPSTREAM_MODEL') or '').replace('\n',','),
+            'fetch':os.environ.get('UPSTREAM_FETCH_MODELS',''),'default':os.environ.get('UPSTREAM_IS_DEFAULT','1')})
+    for i in range(1,51):
+        base=(os.environ.get('UPSTREAM_%d_BASE_URL'%i) or '').strip()
+        if not base: break
+        groups.append({'base':base,'key':(os.environ.get('UPSTREAM_%d_API_KEY'%i) or '').strip(),
+            'name':(os.environ.get('UPSTREAM_%d_NAME'%i) or ('env 上游%d'%i)).strip(),
+            'models':(os.environ.get('UPSTREAM_%d_MODELS'%i) or '').replace('\n',','),
+            'fetch':os.environ.get('UPSTREAM_%d_FETCH_MODELS'%i,''),'default':os.environ.get('UPSTREAM_%d_IS_DEFAULT'%i,'0' if i>1 else '1')})
+    if not groups: return
+    for gi,g in enumerate(groups):
+        base=g['base'].rstrip('/')
+        if not base.startswith('http'): continue
+        key=g['key']
+        raw=(g['models'] or '').replace('\n',',')
+        models=[m.strip() for m in raw.split(',') if m.strip()] or [MODEL_NAME]
+        if g['fetch'].strip().lower() in ('1','true','yes','on'):
+            try:
+                r=requests.get(base+'/models', headers=({'Authorization':'Bearer '+key} if key else {}), timeout=15)
+                ids=[m.get('id') for m in r.json().get('data',[]) if m.get('id')]
+                if ids:
+                    models=ids[:max(1,int(os.environ.get('UPSTREAM_FETCH_MODELS_MAX','500')))]
+                    print('[init] upstream %s: fetched %s model ids' % (g['name'], len(models)))
+            except Exception as e:
+                print('[init] upstream %s: /models fetch failed, fallback to env list:' % g['name'], e)
+        is_default=0 if g['default'].strip().lower() in ('0','false','no','off') else 1
+        for idx, mid in enumerate(models):
+            if c.execute('SELECT 1 FROM model_providers WHERE model_id=? AND base_url=?', (mid, base)).fetchone(): continue
+            c.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds,endpoint_type,modalities,supports_stream,supports_tools) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (g['name'],'openai',base,key,mid,mid,is_default if idx==0 else 0,1,(gi+1)*20+idx,'300','chat_completions','["text"]',1,0))
 
 def current_user():
     uid=session.get('uid')
@@ -338,10 +368,18 @@ def token_count(messages):
 
 def api_auth():
     auth=request.headers.get('Authorization','')
-    if not auth.startswith('Bearer '): return None,None
-    raw=auth.split(' ',1)[1].strip(); key_hash=hashlib.sha256(raw.encode()).hexdigest()
+    raw=''
+    if auth.startswith('Bearer '): raw=auth.split(' ',1)[1].strip()
+    if not raw:
+        # 部分反代/网关会改写 Authorization 头，提供 X-API-Key 作为替代
+        raw=(request.headers.get('X-API-Key') or '').strip()
+    if not raw: return None,None
+    key_hash=hashlib.sha256(raw.encode()).hexdigest()
     row=db().execute('SELECT k.*,u.plan,u.tokens_used_today,u.tokens_reset_date,u.is_active user_active,u.daily_token_limit,u.custom_rate_limit FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=? AND k.is_active=1',(key_hash,)).fetchone()
-    if not row or not row['user_active']: return None,None
+    if not row or not row['user_active']:
+        if os.environ.get('AUTH_DEBUG'):
+            app.logger.warning('AUTH_DEBUG miss: recv_len=%s recv_sha256=%s', len(raw), key_hash)
+        return None,None
     return row,raw
 
 def epay_sign(params):
@@ -1142,7 +1180,14 @@ def models():
 
 def run_gateway_request(payload, target_api='chat_completions'):
     key,_=api_auth()
-    if not key: return jsonify({'error':{'message':'Unauthorized: missing/invalid Bearer API key','type':'auth_error'}}),401
+    if not key:
+        body={'error':{'message':'Unauthorized: missing/invalid Bearer API key','type':'auth_error'}}
+        if os.environ.get('AUTH_DEBUG'):
+            recv=request.headers.get('Authorization','')
+            if recv.startswith('Bearer '): recv=recv[7:].strip()
+            elif not recv: recv=request.headers.get('X-API-Key','')
+            body['error']['auth_debug']={'recv_len':len(recv),'recv_sha256':hashlib.sha256(recv.encode()).hexdigest() if recv else '(header missing)'}
+        return jsonify(body),401
     messages=payload.get('messages') if 'messages' in payload else responses_input_to_chat_messages(payload.get('input',''))
     input_tokens=token_count(messages)
     quota_err=check_quota_and_reset(key,input_tokens)
