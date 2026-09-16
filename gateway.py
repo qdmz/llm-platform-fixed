@@ -455,6 +455,10 @@ def start_upstream_seed_thread():
                 print('[init] upstream seeding finished in background')
             finally:
                 con.close()
+            # 重新部署会清空 SQLite（含速度统计），开启后每次启动自动重测一遍，
+            # auto 才能立刻按"谁快"排序；不影响端口监听（仍在后台线程里）。
+            if (os.environ.get('PROBE_ON_START') or '').strip().lower() in ('1','true','yes','on'):
+                _ok,_info=start_probe_models(); print('[init] PROBE_ON_START:', _info)
         except Exception as e:
             print('[init] upstream seeding failed (ignored):', e)
         finally:
