@@ -27,3 +27,9 @@ secret.key
 .DS_Store
 .idea/
 .vscode/
+
+# Local smoke-test artifacts (curl cookie jars / rendered pages / logs)
+ck*.txt
+dash*.html
+home*.html
+uv*.log

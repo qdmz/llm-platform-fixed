@@ -683,9 +683,11 @@ def index():
     project_html=''.join([f'<div class="card"><span class="pill">{h(x["status"])}</span><h3>{h(x["name"])}</h3><p class="muted">{h(x["description"])}</p>'+(f'<a class="btn btn2" href="{h(x["base_url"])}">打开项目</a>' if x['base_url'] else '')+'</div>' for x in projects]) or '<div class="card">暂无项目</div>'
     am=active_model_rows(); platform_models=''.join([f'<li><b>{h(m["model_id"])}</b> · {h(m["name"])} · {h(m["provider_type"])}</li>' for m in am]) or '<li>暂无启用模型</li>'
     u=current_user(); admin_debug=''
-    if u and u['is_admin']:
-        admin_debug=f'<div class="card"><h3>OpenAI 兼容接口</h3><pre>curl {h(public_base)}/v1/models\nPOST {h(public_base)}/v1/chat/completions</pre></div><div class="card"><h3>平台可用模型</h3><ul>{platform_models}</ul></div>'
-    body=f'<div class="grid"><div class="card"><h3>平台状态</h3><p>Web 网关：<span class="ok">运行中</span></p><p>默认模型：<b>{h((am[0]["model_id"] if am else MODEL_NAME))}</b></p><p class="muted">登录后可创建 API Key 并在聊天测试页验证接口。</p></div>{admin_debug}</div><h2>套餐</h2><div class="grid">{cards}</div><h2>管理项目</h2><div class="grid">{project_html}</div>'
+    if u:
+        model_card=f'<div class="card"><h3>平台可用模型</h3><ul>{platform_models}</ul><p class="muted">接口地址 <b>{h(public_base)}/v1</b>；完整接入示例见 <a href="/dashboard">用户控制台</a>。</p></div>'
+        api_card=f'<div class="card"><h3>OpenAI 兼容接口</h3><pre>curl {h(public_base)}/v1/models\nPOST {h(public_base)}/v1/chat/completions</pre></div>' if u['is_admin'] else ''
+        admin_debug=api_card+model_card
+    body=f'<div class="grid"><div class="card"><h3>平台状态</h3><p>Web 网关：<span class="ok">运行中</span></p><p>默认模型：<b>{h((am[0]["model_id"] if am else MODEL_NAME))}</b></p><p class="muted">OpenAI 兼容接口：<b>{h(public_base)}/v1</b> · 登录后可创建 API Key 并在 <a href="/playground">聊天测试</a> 页验证。</p></div>{admin_debug}</div><h2>套餐</h2><div class="grid">{cards}</div><h2>管理项目</h2><div class="grid">{project_html}</div>'
     return page(body)
 
 @app.route('/login',methods=['GET','POST'])
@@ -813,6 +815,51 @@ def playground():
 <div class="card"><h3>使用说明</h3><p><b>推荐使用自动模式：</b><code>model: "auto"</code></p><ul><li>优先调用第三方 / OpenAI 兼容模型。</li><li>第三方模型故障、超时或返回错误时，自动尝试下一条启用模型。</li><li>请求包含图片/视频/音频/tools 时，会先按后台能力配置筛选模型。</li><li>所有第三方都不可用时，最后才切到本地 Ollama。</li><li><code>stream=true</code> 暂不做自动切换，避免流式响应中途换模型。</li></ul><h3>OpenAI 兼容接口</h3><ul><li><code>/v1/models</code></li><li><code>/v1/chat/completions</code></li><li><code>/v1/responses</code></li><li><code>/v1/messages</code></li></ul><h3>curl 测试命令</h3><pre class="curl-box">{h(curl)}</pre><p class="muted key-line">当前 API Key：{h(raw or '请先在控制台创建；发送一次测试会自动生成或复用 Key')}</p></div>
 </div>''')
 
+def usage_guide_html(sample_key):
+    """OpenAI 兼容接入说明，登录用户可见。"""
+    base_v1=public_base_url()+'/v1'
+    return f'''<div class="card"><h3>使用方法（OpenAI 兼容接口）</h3>
+<p>接口地址：<b>{h(base_v1)}</b><br>认证方式：请求头 <code>Authorization: Bearer &lt;你的 API Key&gt;</code></p>
+<table><tr><th>端点</th><th>方法</th><th>说明</th></tr>
+<tr><td><code>/v1/models</code></td><td>GET</td><td>列出当前可用模型</td></tr>
+<tr><td><code>/v1/chat/completions</code></td><td>POST</td><td>对话补全，支持 <code>stream: true</code> 流式</td></tr>
+<tr><td><code>/v1/responses</code></td><td>POST</td><td>OpenAI Responses 兼容</td></tr>
+<tr><td><code>/v1/messages</code></td><td>POST</td><td>Anthropic Messages 兼容</td></tr></table>
+<p class="muted"><code>model</code> 填 <code>auto</code> 会自动路由（第三方优先、本地兜底），也可以直接填下方模型列表里的模型 ID。</p>
+<h4>curl</h4><pre>curl {h(base_v1)}/chat/completions \\
+  -H "Authorization: Bearer {h(sample_key)}" \\
+  -H "Content-Type: application/json" \\
+  -d '{{"model":"auto","messages":[{{"role":"user","content":"你好"}}]}}'</pre>
+<h4>Python（openai SDK）</h4><pre>from openai import OpenAI
+client = OpenAI(api_key="{h(sample_key)}", base_url="{h(base_v1)}")
+r = client.chat.completions.create(model="auto", messages=[{{"role":"user","content":"你好"}}])
+print(r.choices[0].message.content)</pre>
+<h4>Node.js</h4><pre>import OpenAI from "openai";
+const client = new OpenAI({{ apiKey: "{h(sample_key)}", baseURL: "{h(base_v1)}" }});
+const r = await client.chat.completions.create({{ model: "auto", messages: [{{ role: "user", content: "你好" }}] }});
+console.log(r.choices[0].message.content);</pre>
+<p class="muted">也可以直接用站内 <a href="/playground">聊天测试</a> 页验证连通性；报 401 说明 Key 不对，报 502 说明所有上游模型都调用失败（去后台检查供应商配置）。</p></div>'''
+
+def model_list_html():
+    """所有启用中的模型，登录用户可见。"""
+    rows=active_model_rows()
+    if not rows:
+        return '<div class="card"><h3>可用模型列表</h3><p class="muted">还没有启用中的模型，请联系管理员在管理后台添加模型供应商。</p></div>'
+    trs=[]
+    for m in rows:
+        try: mods='/'.join(json.loads(m['modalities'] or '["text"]'))
+        except Exception: mods='text'
+        caps=[]
+        if m['supports_stream']: caps.append('流式')
+        if m['supports_tools']: caps.append('工具调用')
+        if m['supports_vision']: caps.append('视觉')
+        if m['supports_video']: caps.append('视频')
+        badge=' <span class="pill">默认</span>' if m['is_default'] else ''
+        trs.append(f'<tr><td><b>{h(m["model_id"])}</b>{badge}</td><td>{h(m["display_name"] or m["name"])}</td><td>{h(m["provider_type"])}</td><td>{h(mods)}</td><td>{h(" · ".join(caps) or "文本")}</td></tr>')
+    return f'''<div class="card"><h3>可用模型列表</h3>
+<table><tr><th>模型 ID</th><th>名称</th><th>类型</th><th>模态</th><th>能力</th></tr>{"".join(trs)}</table>
+<p class="muted">实时列表：<code>GET {h(public_base_url())}/v1/models</code>（返回 OpenAI 格式，可直接被客户端拉取）。</p></div>'''
+
 @app.route('/dashboard',methods=['GET','POST'])
 @login_required
 def dashboard():
@@ -854,7 +901,8 @@ def dashboard():
     ticket_html=''.join([f'<li><a href="/ticket/{t["id"]}"><b>#{t["id"]} {h(t["title"])}</b></a> · {h(t["status"])}<br><span class="muted">{h(t["content"])}</span></li>' for t in tickets]) or '<li>暂无</li>'
     plans=''.join([f'<option value="{h(pid)}">{h(v["name"])} ¥{v["price"]:g}</option>' for pid,v in get_plan_config().items() if pid!='free'])
     reveal=f'<div class="card"><h3>新 API Key，只显示一次</h3><pre>{h(newkey)}</pre></div>' if newkey else ''
-    body=f'<div class="two"><div><div class="card"><h2>用户控制台</h2><p>用户：{h(u["username"])} </p><a href="/logout">退出</a></div>{plan_usage}{reveal}<div class="card"><h3>API Keys</h3><p class="muted">已创建 {key_count} / 允许 {max_keys} 个；点击输入框可全选复制。</p><ul>{key_html}</ul><form method="post"><input type="hidden" name="act" value="newkey"><input class="input" name="name" placeholder="Key 名称"><button class="btn">创建 API Key</button></form></div></div><div><div class="card"><h3>购买套餐</h3><form method="post"><input type="hidden" name="act" value="order"><select class="input" name="plan">{plans}</select><select class="input" name="payment_method"><option value="alipay">支付宝</option><option value="wxpay">微信支付</option></select><button class="btn">创建订单</button></form><h4>我的订单</h4><ul>{order_html}</ul></div><div class="card"><h3>提交工单</h3><form method="post"><input type="hidden" name="act" value="ticket"><input class="input" name="title" placeholder="标题"><textarea class="input" name="content" placeholder="问题描述"></textarea><button class="btn btn2">提交</button></form><h4>我的工单</h4><ul>{ticket_html}</ul></div></div></div>'
+    sample_key=newkey or next((dict(k).get('key_plain') for k in keys if dict(k).get('key_plain')), 'sk-你的API Key')
+    body=f'<div class="two"><div><div class="card"><h2>用户控制台</h2><p>用户：{h(u["username"])} </p><a href="/logout">退出</a></div>{plan_usage}{reveal}<div class="card"><h3>API Keys</h3><p class="muted">已创建 {key_count} / 允许 {max_keys} 个；点击输入框可全选复制。</p><ul>{key_html}</ul><form method="post"><input type="hidden" name="act" value="newkey"><input class="input" name="name" placeholder="Key 名称"><button class="btn">创建 API Key</button></form></div></div><div><div class="card"><h3>购买套餐</h3><form method="post"><input type="hidden" name="act" value="order"><select class="input" name="plan">{plans}</select><select class="input" name="payment_method"><option value="alipay">支付宝</option><option value="wxpay">微信支付</option></select><button class="btn">创建订单</button></form><h4>我的订单</h4><ul>{order_html}</ul></div><div class="card"><h3>提交工单</h3><form method="post"><input type="hidden" name="act" value="ticket"><input class="input" name="title" placeholder="标题"><textarea class="input" name="content" placeholder="问题描述"></textarea><button class="btn btn2">提交</button></form><h4>我的工单</h4><ul>{ticket_html}</ul></div></div></div>{usage_guide_html(sample_key)}{model_list_html()}'
     return page(body)
 
 @app.route('/ticket/<int:ticket_id>',methods=['GET','POST'])
