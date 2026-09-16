@@ -1,0 +1,4 @@
+# Keep shell entrypoints LF even when committed from Windows,
+# otherwise Linux fails with "bad interpreter" / "\r: not found".
+*.sh text eol=lf
+Procfile text eol=lf

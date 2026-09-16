@@ -13,6 +13,9 @@ venv/
 data/
 logs/
 models/
+# Default LLM_PLATFORM_HOME used by start.sh / main.py on PaaS hosts
+runtime/
+secret.key
 
 # Secrets / local config
 .env
