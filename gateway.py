@@ -790,6 +790,13 @@ def active_model_rows():
 AUTO_UNKNOWN_MS = float(os.environ.get('AUTO_UNKNOWN_MS', '2500'))        # 未测过模型的中性分
 AUTO_FAIL_PENALTY_MS = float(os.environ.get('AUTO_FAIL_PENALTY_MS', '6000'))  # 失败折算的惩罚毫秒
 AUTO_SORT_MODE = (os.environ.get('AUTO_SORT_MODE', 'speed') or 'speed').strip().lower()  # speed | manual
+# 专用/非通用对话模型（翻译、安全审查、向量、解析等）虽然很快，但不适合做 auto 首选，降权处理
+AUTO_EXCLUDE_PATTERNS = [p.strip().lower() for p in (os.environ.get('AUTO_EXCLUDE_PATTERNS') or 'embed,rerank,guard,safety,translate,detector,moderation,parse').split(',') if p.strip()]
+AUTO_EXCLUDE_PENALTY = float(os.environ.get('AUTO_EXCLUDE_PENALTY', '100000'))
+
+def _auto_excluded(model_id):
+    mid = (model_id or '').lower()
+    return any(p in mid for p in AUTO_EXCLUDE_PATTERNS)
 
 def model_stats_map():
     """{provider_id: stats_row}，只读，供排序用。"""
@@ -825,7 +832,7 @@ def auto_sorted_rows(rows):
                                            int(r['sort_order'] or 100), int(r['id'])))
     stats = model_stats_map()
     return sorted(rows, key=lambda r: (0 if r['provider_type'] != 'ollama' else 1,
-                                       model_auto_score(r, stats),
+                                       model_auto_score(r, stats) + (AUTO_EXCLUDE_PENALTY if _auto_excluded(r['model_id']) else 0),
                                        0 if r['is_default'] else 1,
                                        int(r['sort_order'] or 100), int(r['id'])))
 
@@ -926,7 +933,8 @@ def _probe_one(row, timeout=None):
             body = {'model': row.get('model_id'), 'input': 'hi', 'max_output_tokens': 16}
         else:
             url = base + '/chat/completions'
-            body = {'model': row.get('model_id'), 'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 1, 'temperature': 0}
+            # 不传 temperature：部分模型只接受 temperature=1（传 0 会 400），会造成误判
+            body = {'model': row.get('model_id'), 'messages': [{'role': 'user', 'content': 'hi'}], 'max_tokens': 8}
         r = requests.post(url, headers=headers, json=body, timeout=tmo)
         ms = round((time.time() - t0) * 1000)
         if r.ok:
@@ -1901,7 +1909,7 @@ def admin():
             auto_pick=f'<p>当前 auto 首选：<b>{h(_cand[0]["model_id"])}</b>（{h(_cand[0]["name"])}{("，实测约 %d ms"%_ms) if _ms else "，暂无测速数据"}）· 排序方式 <code>{h(AUTO_SORT_MODE)}</code></p>'
     except Exception: pass
     probe_section=f'''<h3>模型测速 / auto 智能选路</h3>
-<p class="muted">「开始测速」会对所有启用的模型各发一次最小请求，记录真实响应耗时并写入统计。之后 <code>model:"auto"</code> 会<b>按实测速度优先挑最快的模型</b>；连续失败的自动排到最后，从没测过的给中性分（仍有机会被选中）。设 <code>AUTO_SORT_MODE=manual</code> 可改回手工排序，<code>AUTO_UNKNOWN_MS</code> / <code>AUTO_FAIL_PENALTY_MS</code> 可微调权重。</p>
+<p class="muted">「开始测速」会对所有启用的模型各发一次最小请求（不传 temperature，避免部分模型只接受 temperature=1 而误判），记录真实响应耗时并写入统计。之后 <code>model:"auto"</code> 会<b>按实测速度优先挑最快的模型</b>；连续失败的自动排到最后，从没测过的给中性分（仍有机会被选中）。专用模型（embed/rerank/guard/safety/translate/detector/moderation/parse，可用 <code>AUTO_EXCLUDE_PATTERNS</code> 改）会被降权，不当首选。设 <code>AUTO_SORT_MODE=manual</code> 可改回手工排序。</p>
 {auto_pick}{prog}
 <div style="display:flex;gap:10px;flex-wrap:wrap;margin:8px 0 14px">
 <form method="post"><input type="hidden" name="act" value="probe_models"><button class="btn">开始测速（全部启用模型）</button></form>
