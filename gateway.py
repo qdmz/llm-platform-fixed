@@ -304,6 +304,14 @@ def seed_upstream_from_env(c):
             if c.execute('SELECT 1 FROM model_providers WHERE model_id=? AND base_url=?', (mid, base)).fetchone(): continue
             c.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds,endpoint_type,modalities,supports_stream,supports_tools) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (g['name'],'openai',base,key,mid,mid,is_default if idx==0 else 0,1,(gi+1)*20+idx,'300','chat_completions','["text"]',1,0))
+    # 真的导入了上游模型时，把本地 Ollama 占位降级为非默认：
+    # 否则首页"默认模型"会显示一个平台上根本不存在的本地模型。
+    try:
+        if c.execute("SELECT 1 FROM model_providers WHERE provider_type='openai' AND is_default=1 AND is_active=1").fetchone():
+            c.execute("UPDATE model_providers SET is_default=0 WHERE provider_type='ollama'")
+            print('[init] local Ollama placeholder demoted (env upstreams are the default)')
+    except sqlite3.Error as e:
+        print('[init] demote ollama failed (ignored):', e)
 
 def current_user():
     uid=session.get('uid')
