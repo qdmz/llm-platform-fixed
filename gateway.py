@@ -269,13 +269,13 @@ def seed_upstream_from_env(c):
     兼容 OPENAI_BASE_URL / OPENAI_API_KEY / UPSTREAM_MODEL（单个模型）。
     建库时按 `模型ID + Base URL` 去重，重复部署不会产生重复记录。
     """
-    groups=[]
+    groups=[]; _shorthand=None
     base=(os.environ.get('UPSTREAM_BASE_URL') or os.environ.get('OPENAI_BASE_URL') or '').strip()
     if base:
-        groups.append({'base':base,'key':(os.environ.get('UPSTREAM_API_KEY') or os.environ.get('OPENAI_API_KEY') or '').strip(),
+        _shorthand={'base':base,'key':(os.environ.get('UPSTREAM_API_KEY') or os.environ.get('OPENAI_API_KEY') or '').strip(),
             'name':(os.environ.get('UPSTREAM_NAME') or 'env 上游模型').strip() or 'env 上游模型',
             'models':(os.environ.get('UPSTREAM_MODELS') or os.environ.get('UPSTREAM_MODEL') or '').replace('\n',','),
-            'fetch':os.environ.get('UPSTREAM_FETCH_MODELS',''),'default':os.environ.get('UPSTREAM_IS_DEFAULT','1')})
+            'fetch':os.environ.get('UPSTREAM_FETCH_MODELS',''),'default':os.environ.get('UPSTREAM_IS_DEFAULT','1')}
     for i in range(1,51):
         base=(os.environ.get('UPSTREAM_%d_BASE_URL'%i) or '').strip()
         if not base: break
@@ -283,27 +283,63 @@ def seed_upstream_from_env(c):
             'name':(os.environ.get('UPSTREAM_%d_NAME'%i) or ('env 上游%d'%i)).strip(),
             'models':(os.environ.get('UPSTREAM_%d_MODELS'%i) or '').replace('\n',','),
             'fetch':os.environ.get('UPSTREAM_%d_FETCH_MODELS'%i,''),'default':os.environ.get('UPSTREAM_%d_IS_DEFAULT'%i,'0' if i>1 else '1')})
+    # 编号组优先：只有完全没配编号组时才使用简写单上游变量。
+    # 否则遗留的 UPSTREAM_BASE_URL（往往指向与某编号组同一家上游）会抢先插入模型，
+    # 让那家供应商在后台少一个模型（例如 amd 只剩 4 个，另一个挂在 "env 上游模型" 名下）。
+    if groups:
+        if _shorthand:
+            try:
+                _n=c.execute("DELETE FROM model_providers WHERE name='env 上游模型' AND provider_type='openai'").rowcount
+                if _n: print('[init] removed %s legacy shorthand row(s) superseded by numbered upstreams' % _n)
+            except sqlite3.Error as _e:
+                print('[init] legacy shorthand cleanup failed (ignored):', _e)
+    elif _shorthand:
+        groups.append(_shorthand)
     if not groups: return
     for gi,g in enumerate(groups):
         base=g['base'].rstrip('/')
         if not base.startswith('http'): continue
         key=g['key']
         raw=(g['models'] or '').replace('\n',',')
-        models=[m.strip() for m in raw.split(',') if m.strip()] or [MODEL_NAME]
+        models=[m.strip() for m in raw.split(',') if m.strip()]
+        ocr_only=set()
         if g['fetch'].strip().lower() in ('1','true','yes','on'):
-            try:
-                r=requests.get(base+'/models', headers=({'Authorization':'Bearer '+key} if key else {}), timeout=6)
-                ids=[m.get('id') for m in r.json().get('data',[]) if m.get('id')]
-                if ids:
-                    models=ids[:max(1,int(os.environ.get('UPSTREAM_FETCH_MODELS_MAX','500')))]
-                    print('[init] upstream %s: fetched %s model ids' % (g['name'], len(models)))
-            except Exception as e:
-                print('[init] upstream %s: /models fetch failed, fallback to env list:' % g['name'], e)
+            fetched=[]; ocr=set()
+            for attempt in (1,2,3):
+                try:
+                    r=requests.get(base+'/models', headers=({'Authorization':'Bearer '+key} if key else {}), timeout=8)
+                    for m in (r.json().get('data') or []):
+                        mid=m.get('id')
+                        if not mid: continue
+                        if mid not in fetched: fetched.append(mid)
+                        outs=(m.get('output') or (m.get('architecture') or {}).get('output_modalities') or [])
+                        outs=[str(x).lower() for x in outs]
+                        if 'ocr' in outs and 'text' not in outs: ocr.add(mid)
+                    if fetched: break
+                    print('[init] upstream %s: /models returned 0 models (attempt %d/3)' % (g['name'], attempt))
+                except Exception as e:
+                    print('[init] upstream %s: /models attempt %d/3 failed: %s' % (g['name'], attempt, str(e)[:160]))
+                time.sleep(1.5)
+            if fetched:
+                limit=max(1,int(os.environ.get('UPSTREAM_FETCH_MODELS_MAX','500')))
+                kept=fetched[:limit]
+                for mid in models:
+                    if mid not in kept: kept.append(mid)
+                models=kept; ocr_only=ocr
+                print('[init] upstream %s: fetched %s model ids (%s ocr-only)' % (g['name'], len(fetched), len(ocr)))
+            else:
+                print('[init] upstream %s: /models fetch failed after 3 attempts, fallback to env list' % g['name'])
+        if not models: models=[MODEL_NAME]
         is_default=0 if g['default'].strip().lower() in ('0','false','no','off') else 1
+        added=0
         for idx, mid in enumerate(models):
             if c.execute('SELECT 1 FROM model_providers WHERE model_id=? AND base_url=?', (mid, base)).fetchone(): continue
+            mods='["ocr"]' if mid in ocr_only else '["text"]'
+            ep='ocr' if mid in ocr_only else 'chat_completions'
             c.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds,endpoint_type,modalities,supports_stream,supports_tools) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                (g['name'],'openai',base,key,mid,mid,is_default if idx==0 else 0,1,(gi+1)*20+idx,'300','chat_completions','["text"]',1,0))
+                (g['name'],'openai',base,key,mid,mid,is_default if idx==0 else 0,1,(gi+1)*20+idx,'300',ep,mods,0 if mid in ocr_only else 1,0))
+            added+=1
+        print('[init] upstream %s: %s new row(s), %s model(s) total' % (g['name'], added, len(models)))
     # 真的导入了上游模型时，把本地 Ollama 占位降级为非默认：
     # 否则首页"默认模型"会显示一个平台上根本不存在的本地模型。
     try:
