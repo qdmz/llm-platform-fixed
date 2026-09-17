@@ -37,7 +37,7 @@ ADMIN_UNLIMITED = (os.environ.get('ADMIN_UNLIMITED') or '1').strip().lower() not
 ADMIN_PLAN = (os.environ.get('ADMIN_PLAN') or 'enterprise').strip()
 SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
 # 构建标记：每次改完代码手动 +1，/healthz 与 /k 里能看到，用来确认"线上到底跑的是哪一版"
-BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-17.1800'
+BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-17.1810'
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 EPAY_API_URL = os.environ.get('EPAY_API_URL', '').rstrip('/')
 EPAY_PID = os.environ.get('EPAY_PID', '')
@@ -1546,7 +1546,26 @@ def envz():
                 db().execute('SELECT name,key_prefix,user_id,key_hash FROM api_keys ORDER BY id ASC').fetchall()]
     except Exception as e:
         keys = ['(读取失败: %s)' % e]
+    # 配额自检：让"这把 Key 会不会撞 429"变成可读事实，而不是等客户端报错才去猜。
+    try:
+        today=dt.date.today().isoformat()
+        plan_map=get_plan_config(True)
+        is_admin=int(key['user_is_admin'] or 0)
+        used=int(key['tokens_used_today'] or 0) if key['tokens_reset_date']==today else 0
+        lim=[int((plan_map.get(key['plan']) or PLAN_CONFIG['free']).get('daily_tokens') or 0)]
+        if key['daily_token_limit']: lim.append(int(key['daily_token_limit']))
+        if key['quota_daily']: lim.append(int(key['quota_daily']))
+        limit=int(min(lim))
+        quota={'key_name':key['name'], 'plan':key['plan'], 'is_admin':is_admin,
+               'used_today':used, 'limit':limit, 'remaining':max(0,limit-used),
+               'unlimited':bool(ADMIN_UNLIMITED and is_admin),
+               'reset_date':today,
+               'note':'unlimited=true 表示该 Key 不受每日 token 配额限制（账号是管理员且 ADMIN_UNLIMITED 未关闭）；'
+                      'unlimited=false 时 remaining 归零就会返回 429 Daily token quota exceeded。'}
+    except Exception as e:
+        quota={'error':str(e)}
     return jsonify({'ok': True, 'build': BUILD_TAG,
+                    'quota': quota,
                     'env_present': present, 'env_missing_or_empty': missing,
                     'db_api_keys': keys,
                     'hint': '拿客户端里的 Key 做 sha256 取前 8 位，跟 db_api_keys 的 sha256_8 比对；'
