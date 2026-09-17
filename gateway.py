@@ -30,7 +30,7 @@ ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@ypvps.com')
 SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
 # 构建标记：每次改完代码手动 +1，/healthz 与 /k 里能看到，用来确认"线上到底跑的是哪一版"
-BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-17.1600'
+BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-17.1700'
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 EPAY_API_URL = os.environ.get('EPAY_API_URL', '').rstrip('/')
 EPAY_PID = os.environ.get('EPAY_PID', '')
@@ -821,6 +821,10 @@ AUTO_EXCLUDE_PATTERNS = [p.strip().lower() for p in (os.environ.get('AUTO_EXCLUD
 AUTO_EXCLUDE_PENALTY = float(os.environ.get('AUTO_EXCLUDE_PENALTY', '100000'))
 # auto 模式下单个候选的尝试上限：最慢排第一也就是等这么久就换下一个，避免一次请求被慢模型拖到几十秒
 AUTO_TRY_TIMEOUT = int(os.environ.get('AUTO_TRY_TIMEOUT', '25') or 25)
+# 流式请求最多尝试几个候选：proxy_provider 只有在上游已返回 200 响应头后才会把响应交给客户端，
+# 所以在它抛异常（连不上 / 上游 4xx5xx）时换候选是安全的；但个数要限制，免得一连串慢候选
+# 把整次请求拖到 Cloudflare 超时（524）。设 1 可退回到"只试第一个"的老行为。
+STREAM_TRY_LIMIT = int(os.environ.get('STREAM_TRY_LIMIT', '3') or 3)
 _TRY_CTX = threading.local()
 
 def _try_timeout(provider, default=300):
@@ -2191,8 +2195,9 @@ def run_gateway_request(payload, target_api='chat_completions'):
         candidates=filter_candidates_by_capability(raw_candidates,payload,endpoint_types)
     if not candidates:
         return jsonify({'error':{'message':'No provider matches requested model/protocol/capabilities','type':'capability_error','code':'unsupported_modality','required_modalities':sorted(detect_modalities_from_payload(payload))}}),400
-    # Streaming responses cannot be safely retried after bytes may have been sent to the client.
-    if payload.get('stream'): candidates=candidates[:1]
+    # 流式也允许换候选重试：proxy_provider 抛异常时上游还没返回 200 响应头，
+    # 客户端一个字节都没收到，换下一个候选是安全的（只限个数，见 STREAM_TRY_LIMIT）。
+    if payload.get('stream'): candidates=candidates[:STREAM_TRY_LIMIT]
     errors=[]
     _req=(requested or '').strip().lower()
     auto_mode=(not _req) or _req in ('auto','auto:fallback','fallback')
