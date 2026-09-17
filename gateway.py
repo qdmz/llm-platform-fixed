@@ -28,9 +28,16 @@ OLLAMA_BASE_URL = os.environ.get('OLLAMA_BASE_URL', 'http://127.0.0.1:11434')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin123')
 ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@ypvps.com')
+# 管理员账号默认不受"每日 token 配额"限制。
+# 背景：容器盘是临时的，MASTER_API_KEY 每次重新部署都会重建并归属 admin；若 admin 沿用
+# free 套餐（10,000 tokens/天），站主自己用 WorkBuddy 聊天（每条消息都带完整 system prompt
+# + 工具定义）几轮就会撞上 429 Daily token quota exceeded。设 ADMIN_UNLIMITED=0 可恢复限制。
+ADMIN_UNLIMITED = (os.environ.get('ADMIN_UNLIMITED') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
+# admin 用户的套餐（面板显示 / 兜底额度来源）。留空则不改动，保持数据库里的值。
+ADMIN_PLAN = (os.environ.get('ADMIN_PLAN') or 'enterprise').strip()
 SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
 # 构建标记：每次改完代码手动 +1，/healthz 与 /k 里能看到，用来确认"线上到底跑的是哪一版"
-BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-17.1700'
+BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-17.1800'
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 EPAY_API_URL = os.environ.get('EPAY_API_URL', '').rstrip('/')
 EPAY_PID = os.environ.get('EPAY_PID', '')
@@ -378,6 +385,10 @@ CREATE TABLE IF NOT EXISTS email_activations(id INTEGER PRIMARY KEY AUTOINCREMEN
         c.execute('UPDATE users SET email=? WHERE username=? AND email<>?', (ADMIN_EMAIL, ADMIN_USERNAME, ADMIN_EMAIL))
     except sqlite3.IntegrityError:
         pass
+    # admin 的套餐可由 ADMIN_PLAN 指定（默认 enterprise）。只写环境变量就生效，不必进后台改。
+    if ADMIN_PLAN and c.execute('SELECT 1 FROM plans WHERE id=? AND is_active=1', (ADMIN_PLAN,)).fetchone():
+        c.execute('UPDATE users SET plan=?,plan_expires_at=? WHERE is_admin=1',
+                  (ADMIN_PLAN, (dt.datetime.now()+dt.timedelta(days=3650)).isoformat()))
     seed_master_api_key(c)
     con.commit(); con.close()
     start_upstream_seed_thread()
@@ -798,7 +809,7 @@ def api_key_candidates():
 def api_auth():
     for raw in api_key_candidates():
         key_hash=hashlib.sha256(raw.encode()).hexdigest()
-        row=db().execute('SELECT k.*,u.plan,u.tokens_used_today,u.tokens_reset_date,u.is_active user_active,u.daily_token_limit,u.custom_rate_limit FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=? AND k.is_active=1',(key_hash,)).fetchone()
+        row=db().execute('SELECT k.*,u.plan,u.tokens_used_today,u.tokens_reset_date,u.is_active user_active,u.is_admin user_is_admin,u.daily_token_limit,u.custom_rate_limit FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=? AND k.is_active=1',(key_hash,)).fetchone()
         if row and row['user_active']: return row,raw
         if os.environ.get('AUTH_DEBUG'):
             app.logger.warning('AUTH_DEBUG miss: recv_len=%s recv_sha256=%s', len(raw), key_hash)
@@ -1303,14 +1314,28 @@ def chat_completion_to_response(data, model):
     return {'id':data.get('id','resp-proxy'),'object':'response','created_at':time.time(),'model':data.get('model') or model,'output_text':content,'output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':content}]}],'usage':{'input_tokens':usage.get('prompt_tokens',0),'output_tokens':usage.get('completion_tokens',0),'total_tokens':usage.get('total_tokens',0)}}
 
 def check_quota_and_reset(key, input_tokens):
+    # 管理员账号豁免：MASTER_API_KEY 归属 admin，站主自用不该被"免费版 1 万 tokens/天"卡住。
+    try: is_admin=int(key['user_is_admin'] or 0)
+    except Exception: is_admin=0
+    if ADMIN_UNLIMITED and is_admin: return None
     today=dt.date.today().isoformat(); con=db()
     if key['tokens_reset_date']!=today:
         con.execute('UPDATE users SET tokens_used_today=0,tokens_reset_date=? WHERE id=?',(today,key['user_id'])); con.commit(); used=0
-    else: used=key['tokens_used_today']
-    plan_limit=get_plan_config(True).get(key['plan'],PLAN_CONFIG['free'])['daily_tokens']; limits=[plan_limit]
+    else: used=int(key['tokens_used_today'] or 0)
+    plan_limit=get_plan_config(True).get(key['plan'],PLAN_CONFIG['free'])['daily_tokens']; limits=[int(plan_limit or 0)]
     if key['daily_token_limit']: limits.append(int(key['daily_token_limit']))
     if key['quota_daily']: limits.append(int(key['quota_daily']))
-    if used+input_tokens>min(limits): return jsonify({'error':{'message':'Daily token quota exceeded','type':'quota_error'}}),429
+    limit=int(min(limits))
+    if used+input_tokens>limit:
+        # 报错里带上账号/套餐/已用量，便于对方（或未来的自己）一眼定位是"配额"而不是"模型坏了"。
+        return jsonify({'error':{'message':'Daily token quota exceeded','type':'quota_error',
+                                 'code':'quota_exceeded','plan':key['plan'],'limit':limit,
+                                 'used':used,'requested_input_tokens':int(input_tokens),
+                                 'requested_total_tokens':used+int(input_tokens),
+                                 'reset_at':today+' 00:00 (server local)',
+                                 'key_name':key['name'],
+                                 'hint':'该 API Key 所属账号今日额度已用尽。admin 账号可用 ADMIN_UNLIMITED=1（默认）豁免；'
+                                        '调整额度可用 PLAN_<套餐ID>_TOKENS（如 PLAN_FREE_TOKENS=200000）。'}}),429
     return None
 
 def record_usage(key, input_tokens, output_tokens, model, endpoint, start):
@@ -1483,7 +1508,7 @@ def healthz():
 # 用途：平台上的变量是 source 进容器的，用户常常以为加了其实没生效，靠这个一眼定位。
 _ENV_WATCH_PREFIXES = ('UPSTREAM_', 'AUTO_', 'PROBE_', 'PLAN_')
 _ENV_WATCH_EXACT = ('MASTER_API_KEY', 'STATIC_API_KEY', 'EXTRA_API_KEYS',
-                    'ADMIN_USERNAME', 'ADMIN_EMAIL', 'ADMIN_PASSWORD', 'SITE_NAME',
+                    'ADMIN_USERNAME', 'ADMIN_EMAIL', 'ADMIN_PASSWORD', 'ADMIN_UNLIMITED', 'ADMIN_PLAN', 'SITE_NAME',
                     'MODEL_NAME', 'OLLAMA_BASE_URL', 'EPAY_API_URL', 'EPAY_PID', 'EPAY_KEY',
                     'SMTP_HOST', 'SMTP_USER', 'SMTP_FROM', 'MODELS_REQUIRE_AUTH', 'DEMO_FALLBACK',
                     # 这些带前缀的变量"不存在"时也要报出来，所以必须显式列名（光靠前缀扫不到缺失项）
