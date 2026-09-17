@@ -30,7 +30,7 @@ ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@ypvps.com')
 SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
 # 构建标记：每次改完代码手动 +1，/healthz 与 /k 里能看到，用来确认"线上到底跑的是哪一版"
-BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-16.2350'
+BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-17.1235'
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 EPAY_API_URL = os.environ.get('EPAY_API_URL', '').rstrip('/')
 EPAY_PID = os.environ.get('EPAY_PID', '')
@@ -335,7 +335,7 @@ CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id 
 CREATE TABLE IF NOT EXISTS ticket_messages(id INTEGER PRIMARY KEY AUTOINCREMENT,ticket_id INTEGER NOT NULL,user_id INTEGER,author_role TEXT DEFAULT 'user',message TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(ticket_id) REFERENCES tickets(id),FOREIGN KEY(user_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY,name TEXT NOT NULL,price REAL DEFAULT 0,daily_tokens INTEGER DEFAULT 0,rate_limit INTEGER DEFAULT 60,days INTEGER DEFAULT 30,is_active INTEGER DEFAULT 1,sort_order INTEGER DEFAULT 100,description TEXT DEFAULT '',updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS managed_projects(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,slug TEXT UNIQUE NOT NULL,description TEXT DEFAULT '',base_url TEXT DEFAULT '',status TEXT DEFAULT 'active',sort_order INTEGER DEFAULT 100,created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS model_providers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,provider_type TEXT DEFAULT 'openai',base_url TEXT DEFAULT '',api_key TEXT DEFAULT '',model_id TEXT NOT NULL,display_name TEXT DEFAULT '',is_default INTEGER DEFAULT 0,is_active INTEGER DEFAULT 1,sort_order INTEGER DEFAULT 100,timeout_seconds INTEGER DEFAULT 300,endpoint_type TEXT DEFAULT 'chat_completions',modalities TEXT DEFAULT '["text"]',supports_stream INTEGER DEFAULT 1,supports_tools INTEGER DEFAULT 0,supports_vision INTEGER DEFAULT 0,supports_video INTEGER DEFAULT 0,max_input_tokens INTEGER,max_output_tokens INTEGER,extra_config TEXT DEFAULT '{}',created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS model_providers(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,provider_type TEXT DEFAULT 'openai',base_url TEXT DEFAULT '',api_key TEXT DEFAULT '',model_id TEXT NOT NULL,display_name TEXT DEFAULT '',is_default INTEGER DEFAULT 0,is_active INTEGER DEFAULT 1,auto_disabled INTEGER DEFAULT 0,auto_disabled_at TEXT,sort_order INTEGER DEFAULT 100,timeout_seconds INTEGER DEFAULT 300,endpoint_type TEXT DEFAULT 'chat_completions',modalities TEXT DEFAULT '["text"]',supports_stream INTEGER DEFAULT 1,supports_tools INTEGER DEFAULT 0,supports_vision INTEGER DEFAULT 0,supports_video INTEGER DEFAULT 0,max_input_tokens INTEGER,max_output_tokens INTEGER,extra_config TEXT DEFAULT '{}',created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS model_stats(provider_id INTEGER PRIMARY KEY,ok_count INTEGER DEFAULT 0,fail_count INTEGER DEFAULT 0,avg_ms REAL DEFAULT 0,last_ms REAL DEFAULT 0,fail_streak INTEGER DEFAULT 0,last_error TEXT DEFAULT '',updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS invoices(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,order_id INTEGER NOT NULL,invoice_no TEXT UNIQUE NOT NULL,company_name TEXT NOT NULL,tax_id TEXT,amount REAL NOT NULL,status TEXT DEFAULT 'pending',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(user_id) REFERENCES users(id),FOREIGN KEY(order_id) REFERENCES orders(id));
 CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY,value TEXT DEFAULT '',updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
@@ -353,7 +353,9 @@ CREATE TABLE IF NOT EXISTS email_activations(id INTEGER PRIMARY KEY AUTOINCREMEN
         'ALTER TABLE model_providers ADD COLUMN supports_video INTEGER DEFAULT 0',
         'ALTER TABLE model_providers ADD COLUMN max_input_tokens INTEGER',
         'ALTER TABLE model_providers ADD COLUMN max_output_tokens INTEGER',
-        "ALTER TABLE model_providers ADD COLUMN extra_config TEXT DEFAULT '{}'"
+        "ALTER TABLE model_providers ADD COLUMN extra_config TEXT DEFAULT '{}'",
+        'ALTER TABLE model_providers ADD COLUMN auto_disabled INTEGER DEFAULT 0',
+        'ALTER TABLE model_providers ADD COLUMN auto_disabled_at TEXT'
     ]:
         try: c.execute(ddl)
         except sqlite3.OperationalError: pass
@@ -907,6 +909,90 @@ def record_model_result(provider_id, ok, ms=0, error=''):
     except Exception as e:
         print('[stats] record failed (ignored):', e)
 
+# ---------- 测完自动启停：不可用的模型临时停用（is_active=0），测通自动恢复 ----------
+# 目的：让调用侧（auto / 显式指定）根本不会路由到"检测不可用"的模型，避免报错。
+# 只标记由测速造成的停用（auto_disabled=1），管理员手工停用的模型不受影响、也不会被自动恢复。
+PROBE_AUTO_DISABLE = (os.environ.get('PROBE_AUTO_DISABLE') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
+PROBE_DISABLE_STREAK = int(os.environ.get('PROBE_DISABLE_STREAK', '2') or 2)   # 模糊失败（超时/5xx/限流）要连败几次才停
+AUTO_MIN_ACTIVE = int(os.environ.get('AUTO_MIN_ACTIVE', '3') or 3)             # 兜底：至少保留这么多个启用模型，防止全停
+# 这些 HTTP 状态码说明"这个模型在上游就是不可用"（没权限/没额度/不存在），测到一次就停，不用等连败
+PROBE_DISABLE_NOW_STATUS = (400, 401, 402, 403, 404, 405, 407, 410)
+
+def set_auto_disabled(provider_id, disable):
+    """临时停用 / 恢复一个模型。只动 is_active 与 auto_disabled 标记，其余配置不碰。"""
+    con = _stats_conn()
+    try:
+        if disable:
+            con.execute("UPDATE model_providers SET is_active=0,auto_disabled=1,auto_disabled_at=CURRENT_TIMESTAMP WHERE id=?", (int(provider_id),))
+        else:
+            con.execute("UPDATE model_providers SET is_active=1,auto_disabled=0,auto_disabled_at=NULL WHERE id=?", (int(provider_id),))
+        con.commit()
+    finally:
+        con.close()
+
+def _probe_disable_status(err):
+    """从探针错误串里解析 HTTP 状态码（_probe_one 返回 'HTTP <code> ...'）。"""
+    m = re.match(r'^HTTP (\d{3})\b', str(err or ''))
+    return int(m.group(1)) if m else None
+
+def _probe_apply_availability(row, ok, err=''):
+    """测速后按结果自动启停。返回 (disabled, restored, note)。任何异常都不影响测速主流程。"""
+    if not PROBE_AUTO_DISABLE:
+        return (False, False, '')
+    try:
+        pid = int(row['id']); mid = row.get('model_id') or ('#%s' % pid)
+        if ok:
+            if int(row.get('auto_disabled') or 0):
+                set_auto_disabled(pid, False)
+                print('[probe] %s 测通了，已自动恢复启用' % mid)
+                return (False, True, '已自动恢复启用')
+            return (False, False, '')
+        # ---- 失败：决定要不要临时停用 ----
+        try:
+            con = _stats_conn()
+            st = con.execute("SELECT fail_streak FROM model_stats WHERE provider_id=?", (pid,)).fetchone()
+            streak = int(st[0] or 0) if st else 1
+            # 兜底计数只算"真正可用的对话模型"：排除本地 Ollama 占位与 OCR 专用端点
+            active = int(con.execute("SELECT COUNT(*) FROM model_providers WHERE is_active=1 AND provider_type<>'ollama' AND (endpoint_type IS NULL OR endpoint_type<>'ocr')").fetchone()[0] or 0)
+            con.close()
+        except Exception:
+            return (False, False, '')
+        if int(row.get('is_active') or 0) != 1 or int(row.get('auto_disabled') or 0) == 1:
+            return (False, False, '')          # 已经是停用状态，不用重复处理
+        code = _probe_disable_status(err)
+        now = code in PROBE_DISABLE_NOW_STATUS
+        if not now and streak < PROBE_DISABLE_STREAK:
+            return (False, False, '')          # 模糊失败（超时/5xx/限流）先观察，连败到阈值再停
+        if active <= AUTO_MIN_ACTIVE:
+            print('[probe] %s 失败(%s)，但启用中的模型只剩 %d 个（下限 %d），暂不停用' % (mid, code or 'timeout', active, AUTO_MIN_ACTIVE))
+            return (False, False, '已达启用下限，暂不停用')
+        set_auto_disabled(pid, True)
+        print('[probe] 已临时停用 %s（%s，连败 %d 次）——调用侧不会再路由到它' % (mid, ('HTTP %s' % code) if code else '超时/5xx', streak))
+        return (True, False, '已临时停用（连败 %d）' % streak)
+    except Exception as e:
+        print('[probe] auto disable failed (ignored):', e)
+        return (False, False, '')
+
+def auto_disabled_rows():
+    """当前被测速自动停用的模型（给后台面板展示 / 一键恢复用）。"""
+    try:
+        con = _stats_conn(); con.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in con.execute("SELECT * FROM model_providers WHERE auto_disabled=1 ORDER BY id").fetchall()]
+        finally:
+            con.close()
+    except Exception:
+        return []
+
+def restore_auto_disabled():
+    """一键恢复所有"被测速自动停用"的模型（管理员手工停用的不动）。返回恢复条数。"""
+    con = _stats_conn()
+    try:
+        cur = con.execute("UPDATE model_providers SET is_active=1,auto_disabled=0,auto_disabled_at=NULL WHERE auto_disabled=1")
+        con.commit(); return cur.rowcount
+    finally:
+        con.close()
+
 def reset_model_stats():
     try:
         con = _stats_conn()
@@ -919,14 +1005,18 @@ def reset_model_stats():
         print('[stats] reset failed:', e); return False
 
 # ---------- 后台「一键测速」：实测每个模型的响应速度 ----------
-PROBE_STATE = {'running': False, 'total': 0, 'done': 0, 'ok': 0, 'fail': 0,
+PROBE_STATE = {'running': False, 'total': 0, 'done': 0, 'ok': 0, 'fail': 0, 'disabled': 0, 'restored': 0,
                'started_at': '', 'finished_at': '', 'last': []}
 
 def _probe_targets():
-    """需要测速的模型行（跳过本地 Ollama 与 OCR 专用端点）。"""
+    """需要测速的模型行（跳过本地 Ollama 与 OCR 专用端点）。
+
+    除了启用中的模型，也包含"被测速自动停用"的模型——它们必须继续被探测，
+    否则一旦误判就永远没有翻身机会。管理员手工停用（auto_disabled=0 且 is_active=0）的不测。
+    """
     con = _stats_conn(); con.row_factory = sqlite3.Row
     try:
-        rows = [dict(r) for r in con.execute('SELECT * FROM model_providers WHERE is_active=1 ORDER BY id').fetchall()]
+        rows = [dict(r) for r in con.execute("SELECT * FROM model_providers WHERE is_active=1 OR auto_disabled=1 ORDER BY id").fetchall()]
     finally:
         con.close()
     out = []
@@ -984,6 +1074,7 @@ def start_probe_models(max_workers=None):
     if not targets:
         return False, '没有可测速的模型（已跳过本地 Ollama 与 OCR 端点）'
     PROBE_STATE.update({'running': True, 'total': len(targets), 'done': 0, 'ok': 0, 'fail': 0,
+                        'disabled': 0, 'restored': 0,
                         'started_at': time.strftime('%Y-%m-%d %H:%M:%S'), 'finished_at': '', 'last': []})
 
     def worker():
@@ -998,21 +1089,26 @@ def start_probe_models(max_workers=None):
                     except Exception as e:
                         ok, ms, err = False, 0, str(e)[:150]
                     record_model_result(row['id'], ok, ms, err)
+                    _dis, _res, _note = _probe_apply_availability(row, ok, err)
+                    if _dis:
+                        PROBE_STATE['disabled'] += 1
+                    if _res:
+                        PROBE_STATE['restored'] += 1
                     PROBE_STATE['done'] += 1
                     if ok:
                         PROBE_STATE['ok'] += 1
                     else:
                         PROBE_STATE['fail'] += 1
-                    PROBE_STATE['last'] = (PROBE_STATE['last'] + [{'model': row.get('model_id'), 'upstream': row.get('name'), 'ok': ok, 'ms': ms}])[-8:]
+                    PROBE_STATE['last'] = (PROBE_STATE['last'] + [{'model': row.get('model_id'), 'upstream': row.get('name'), 'ok': ok, 'ms': ms, 'note': _note}])[-8:]
         except Exception as e:
             print('[probe] worker crashed:', e)
         finally:
             PROBE_STATE['running'] = False
             PROBE_STATE['finished_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-            print('[probe] finished: %s ok / %s fail' % (PROBE_STATE['ok'], PROBE_STATE['fail']))
+            print('[probe] finished: %s ok / %s fail；本次临时停用 %s 个、自动恢复 %s 个' % (PROBE_STATE['ok'], PROBE_STATE['fail'], PROBE_STATE['disabled'], PROBE_STATE['restored']))
 
     threading.Thread(target=worker, name='model-probe', daemon=True).start()
-    return True, '已在后台开始测速 %d 个模型（并发 %s），完成后 auto 会按实测速度排序' % (len(targets), os.environ.get('PROBE_CONCURRENCY', '4'))
+    return True, '已在后台开始测速 %d 个模型（并发 %s），完成后 auto 按实测速度排序，不可用的会临时停用（PROBE_AUTO_DISABLE=%s）' % (len(targets), os.environ.get('PROBE_CONCURRENCY', '4'), '1' if PROBE_AUTO_DISABLE else '0')
 
 def candidate_model_rows(requested):
     rows=list(active_model_rows())
@@ -1025,7 +1121,8 @@ def candidate_model_rows(requested):
     for r in rows:
         if req in (r['model_id'], r['display_name'], r['name']): exact.append(r)
         else: rest.append(r)
-    return exact+rest if exact else rows
+    # 找不到完全匹配（比如模型被测速自动停用了）→ 退回"按实测速度排序"的候选，照样能答，不会报错
+    return exact+rest if exact else auto_sorted_rows(rows)
 
 def select_model(requested):
     rows=candidate_model_rows(requested)
@@ -1920,6 +2017,8 @@ def admin():
             _ok,_info=start_probe_models(); msg=_info
         elif act=='reset_model_stats':
             reset_model_stats(); msg='已清空全部速度统计，auto 将回到默认顺序（可重新测速）'
+        elif act=='restore_auto_disabled':
+            _n=restore_auto_disabled(); msg='已恢复 %d 个被测速自动停用的模型' % _n
         elif act=='delete_model': con.execute('DELETE FROM model_providers WHERE id=?',(request.form.get('model_row_id'),)); con.commit(); msg='模型配置已删除'
     st=get_settings(); pay_missing=[]
     if st.get('payment_enabled')!='1': pay_missing.append('未启用')
@@ -1977,12 +2076,14 @@ def admin():
     up_rows=''.join(f'<tr><td>{h(nm)}</td><td>{a["n"]}</td><td>{int(a["sum"]/a["n"])} ms</td><td>{int(a["min"])} ms</td><td>{a["ok"]}/{a["bad"]}</td></tr>' for nm,a in sorted(_agg.items(), key=lambda kv: kv[1]['sum']/kv[1]['n'])) or '<tr><td colspan="5" class="muted">暂无数据</td></tr>'
     _bad=[r for r in _srows if int(r['streak'] or 0)>=2 or (int(r['bad'] or 0)>0 and int(r['ok'] or 0)==0)]
     bad_rows=''.join(f'<tr><td>{h(r["model_id"])}</td><td>{h(r["name"])}</td><td>{int(r["ok"] or 0)}/{int(r["bad"] or 0)}</td><td class="muted">{h((r["err"] or "")[:90])}</td></tr>' for r in _bad[:15]) or '<tr><td colspan="4" class="muted">暂无连续失败的模型</td></tr>'
+    _adis=auto_disabled_rows(); adis_count=len(_adis)
+    adis_rows=''.join(f'<tr><td>{h(r["model_id"])}</td><td>{h(r["name"])}</td><td class="muted">{h((r.get("auto_disabled_at") or "")[:19])}</td></tr>' for r in _adis[:20]) or '<tr><td colspan="3" class="muted">没有被自动停用的模型</td></tr>'
     ps=PROBE_STATE; prog=''
     if ps.get('running'):
         pct=int(100*ps['done']/ps['total']) if ps.get('total') else 0
-        prog=f'<p class="ok">测速进行中：{ps["done"]}/{ps["total"]}（成功 {ps["ok"]} · 失败 {ps["fail"]}），开始于 {h(ps["started_at"])}，刷新页面看进度</p><div style="height:8px;background:var(--line);border-radius:6px;overflow:hidden;margin:6px 0 10px"><div style="height:8px;width:{pct}%;background:linear-gradient(90deg,var(--primary),var(--primary2))"></div></div>'
+        prog=f'<p class="ok">测速进行中：{ps["done"]}/{ps["total"]}（成功 {ps["ok"]} · 失败 {ps["fail"]} · 已临时停用 {ps.get("disabled",0)} · 自动恢复 {ps.get("restored",0)}），开始于 {h(ps["started_at"])}，刷新页面看进度</p><div style="height:8px;background:var(--line);border-radius:6px;overflow:hidden;margin:6px 0 10px"><div style="height:8px;width:{pct}%;background:linear-gradient(90deg,var(--primary),var(--primary2))"></div></div>'
     elif ps.get('finished_at'):
-        prog=f'<p class="muted">上次测速：{h(ps["started_at"])} → {h(ps["finished_at"])}，共 {ps["total"]} 个（成功 {ps["ok"]} · 失败 {ps["fail"]}）</p>'
+        prog=f'<p class="muted">上次测速：{h(ps["started_at"])} → {h(ps["finished_at"])}，共 {ps["total"]} 个（成功 {ps["ok"]} · 失败 {ps["fail"]} · 本次临时停用 {ps.get("disabled",0)} · 自动恢复 {ps.get("restored",0)}）</p>'
     auto_pick=''
     try:
         _cand=auto_sorted_rows(active_model_rows()); _sm=model_stats_map()
@@ -1992,14 +2093,17 @@ def admin():
     except Exception: pass
     probe_section=f'''<h3>模型测速 / auto 智能选路</h3>
 <p class="muted">「开始测速」会对所有启用的模型各发一次最小请求（不传 temperature，避免部分模型只接受 temperature=1 而误判），记录真实响应耗时并写入统计。之后 <code>model:"auto"</code> 会<b>按实测速度优先挑最快的模型</b>；连续失败的自动排到最后，从没测过的给中性分（仍有机会被选中）。专用模型（embed/rerank/guard/safety/translate/detector/moderation/parse，可用 <code>AUTO_EXCLUDE_PATTERNS</code> 改）会被降权，不当首选。设 <code>AUTO_SORT_MODE=manual</code> 可改回手工排序。</p>
+<p class="muted"><b>自动启停</b>：测完会按结果自动保存可用性——测通的模型如果之前被自动停用，会立即恢复；检测不可用的模型会被<b>临时停用</b>（<code>is_active=0</code> + 标记 <code>auto_disabled=1</code>），调用侧（auto 和显式指定）都<b>不会</b>再路由到它。没权限/没额度/模型不存在（HTTP 400/401/402/403/404 等）测到一次就停；超时/5xx/限流这类偶发失败要连败 <code>PROBE_DISABLE_STREAK</code>（默认 2）次才停，避免误伤。之后哪次测通了会自动恢复启用；也保留至少 <code>AUTO_MIN_ACTIVE</code>（默认 3）个启用模型兜底。管理员<b>手工</b>停用的模型不受影响、也不会被自动恢复。整组开关：<code>PROBE_AUTO_DISABLE=0</code> 关闭。</p>
 {auto_pick}{prog}
 <div style="display:flex;gap:10px;flex-wrap:wrap;margin:8px 0 14px">
 <form method="post"><input type="hidden" name="act" value="probe_models"><button class="btn">开始测速（全部启用模型）</button></form>
 <form method="post"><input type="hidden" name="act" value="reset_model_stats"><button class="btn btn-danger">清空速度统计</button></form>
+<form method="post"><input type="hidden" name="act" value="restore_auto_disabled"><button class="btn btn2">恢复全部自动停用（{adis_count}）</button></form>
 </div>
 <div class="grid"><div><h4>最快的 12 个模型</h4><table width="100%"><tr><th>#</th><th>模型</th><th>上游</th><th>平均耗时</th><th>成功/失败</th></tr>{fast_rows}</table></div>
 <div><h4>上游平均耗时</h4><table width="100%"><tr><th>上游</th><th>已测模型</th><th>平均</th><th>最快</th><th>成功/失败</th></tr>{up_rows}</table></div></div>
-<h4>连续失败 / 从未成功的模型（建议在下方批量维护里禁用）</h4><table width="100%"><tr><th>模型</th><th>上游</th><th>成功/失败</th><th>最近错误</th></tr>{bad_rows}</table>'''
+<h4>被测速自动停用的模型（{adis_count} 个 · 调用侧不会路由到它们 · 测通自动恢复）</h4><table width="100%"><tr><th>模型</th><th>上游</th><th>停用时间</th></tr>{adis_rows}</table>
+<h4>连续失败 / 从未成功的模型</h4><table width="100%"><tr><th>模型</th><th>上游</th><th>成功/失败</th><th>最近错误</th></tr>{bad_rows}</table>'''
     body=f'''<div class="card"><h2>管理后台</h2>{'<p class="ok">'+h(msg)+'</p>' if msg else ''}
 <h3>易支付配置</h3><p>当前支付状态：{pay_status}</p><form method="post"><input type="hidden" name="act" value="save_epay"><div class="grid"><div><label>启用支付</label><select class="input" name="payment_enabled"><option value="0" {sel(st.get('payment_enabled'),'0')}>禁用/演示</option><option value="1" {sel(st.get('payment_enabled'),'1')}>启用</option></select></div><div><label>易支付网关</label><input class="input" name="epay_api_url" value="{h(st.get('epay_api_url',''))}" placeholder="https://epay.example.com"></div><div><label>商户 PID</label><input class="input" name="epay_pid" value="{h(st.get('epay_pid',''))}"></div><div><label>商户 Key</label><input class="input" name="epay_key" value="{h(st.get('epay_key',''))}"></div><div><label>域名</label><input class="input" name="domain" value="{h(st.get('domain',''))}"></div><div><label>公网 Base URL</label><input class="input" name="public_base_url" value="{h(st.get('public_base_url',''))}"></div></div><button class="btn">保存易支付配置</button></form>
 <h3>SMTP 邮件配置</h3><form method="post"><input type="hidden" name="act" value="save_smtp"><div class="grid"><div><label>启用 SMTP</label><select class="input" name="smtp_enabled"><option value="0" {sel(st.get('smtp_enabled'),'0')}>禁用</option><option value="1" {sel(st.get('smtp_enabled'),'1')}>启用</option></select></div><div><label>SMTP Host</label><input class="input" name="smtp_host" value="{h(st.get('smtp_host',''))}" placeholder="smtp.example.com"></div><div><label>端口</label><input class="input" name="smtp_port" value="{h(st.get('smtp_port','587'))}"></div><div><label>加密</label><select class="input" name="smtp_encryption"><option value="tls" {sel(st.get('smtp_encryption'),'tls')}>TLS/STARTTLS</option><option value="ssl" {sel(st.get('smtp_encryption'),'ssl')}>SSL</option><option value="none" {sel(st.get('smtp_encryption'),'none')}>不加密</option></select></div><div><label>账号</label><input class="input" name="smtp_username" value="{h(st.get('smtp_username',''))}"></div><div><label>密码/授权码</label><input class="input" name="smtp_password" value="{h(st.get('smtp_password',''))}"></div><div><label>发件邮箱</label><input class="input" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"></div><div><label>发件名称</label><input class="input" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"></div></div><button class="btn">保存 SMTP 配置</button></form><form method="post"><input type="hidden" name="act" value="test_smtp"><input type="hidden" name="smtp_enabled" value="{h(st.get('smtp_enabled','0'))}"><input type="hidden" name="smtp_host" value="{h(st.get('smtp_host',''))}"><input type="hidden" name="smtp_port" value="{h(st.get('smtp_port','587'))}"><input type="hidden" name="smtp_username" value="{h(st.get('smtp_username',''))}"><input type="hidden" name="smtp_password" value="{h(st.get('smtp_password',''))}"><input type="hidden" name="smtp_encryption" value="{h(st.get('smtp_encryption','tls'))}"><input type="hidden" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"><input type="hidden" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"><div class="grid"><div><label>测试收件邮箱</label><input class="input" name="test_email" value="{h(current_user()['email'] or '')}"></div></div><button class="btn btn2">发送测试邮件</button></form>
