@@ -30,7 +30,7 @@ ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
 ADMIN_EMAIL = os.environ.get('ADMIN_EMAIL', 'admin@ypvps.com')
 SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
 # 构建标记：每次改完代码手动 +1，/healthz 与 /k 里能看到，用来确认"线上到底跑的是哪一版"
-BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-17.1235'
+BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-17.1600'
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 EPAY_API_URL = os.environ.get('EPAY_API_URL', '').rstrip('/')
 EPAY_PID = os.environ.get('EPAY_PID', '')
@@ -574,7 +574,7 @@ def seed_upstream_from_env(c):
             mods='["ocr"]' if mid in ocr_only else '["text"]'
             ep='ocr' if mid in ocr_only else 'chat_completions'
             c.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds,endpoint_type,modalities,supports_stream,supports_tools) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                (g['name'],'openai',base,key,mid,mid,is_default if idx==0 else 0,1,(gi+1)*20+idx,'300',ep,mods,0 if mid in ocr_only else 1,0))
+                (g['name'],'openai',base,key,mid,mid,is_default if idx==0 else 0,1,(gi+1)*20+idx,'300',ep,mods,0 if mid in ocr_only else 1,0 if mid in ocr_only else 1))
             added+=1
         print('[init] upstream %s: %s new row(s), %s model(s) total' % (g['name'], added, len(models)))
     # 真的导入了上游模型时，把本地 Ollama 占位降级为非默认：
@@ -635,7 +635,10 @@ def infer_model_capabilities(model_id, provider_name='', meta=None):
     text=((provider_name or '')+' '+(model_id or '')).lower()
     meta=meta or {}
     modalities={'text'}
-    supports_tools=0
+    # 默认按"支持工具调用"处理：绝大多数 OpenAI 兼容上游都支持 function calling，
+    # 而把它们标成 0 会让带 tools 的客户端请求被整类拒绝（capability_error 400）。
+    # 真正不支持的会被下面的 non_chat 规则或实测结果纠正。
+    supports_tools=1
     supports_stream=1
     ctx=None; out=None
     # Common metadata fields from OpenAI-compatible aggregators.
@@ -1189,19 +1192,29 @@ def detect_modalities_from_payload(payload):
 
 def filter_candidates_by_capability(candidates, payload, endpoint_types=None):
     required=detect_modalities_from_payload(payload)
-    filtered=[]
-    for p in candidates:
+    def _ok(p, check_tools, check_stream):
         et=get_provider_endpoint_type(p)
         if endpoint_types and et not in endpoint_types:
-            continue
+            return False
         if not required.issubset(get_provider_modalities(p)):
-            continue
-        if payload.get('stream') and not int(p['supports_stream'] if 'supports_stream' in p.keys() else 1):
-            continue
-        if payload.get('tools') and not int(p['supports_tools'] if 'supports_tools' in p.keys() else 0):
-            continue
-        filtered.append(p)
-    return filtered
+            return False
+        if check_stream and payload.get('stream') and not int(p['supports_stream'] if 'supports_stream' in p.keys() else 1):
+            return False
+        if check_tools and payload.get('tools') and not int(p['supports_tools'] if 'supports_tools' in p.keys() else 0):
+            return False
+        return True
+    # 逐级放宽：模态 / 协议类型是硬约束，tools 与 stream 只是"尽力推断"的能力标记，
+    # 标记缺失或标错时不能让整类请求直接 400（否则带 tools 的客户端会完全无法使用）。
+    # 先按完整条件过滤；结果为空时依次放弃 tools、stream 的标记要求重试。
+    for check_tools, check_stream in ((True, True), (False, True), (False, False)):
+        filtered=[p for p in candidates if _ok(p, check_tools, check_stream)]
+        if filtered:
+            if payload.get('tools') and not check_tools:
+                print('[route] no candidate declares tools support; routing without the tools capability requirement')
+            if payload.get('stream') and not check_stream:
+                print('[route] no candidate declares stream support; routing without the stream capability requirement')
+            return filtered
+    return []
 
 def chat_messages_to_responses_input(messages):
     result=[]
