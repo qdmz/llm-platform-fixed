@@ -37,7 +37,7 @@ ADMIN_UNLIMITED = (os.environ.get('ADMIN_UNLIMITED') or '1').strip().lower() not
 ADMIN_PLAN = (os.environ.get('ADMIN_PLAN') or 'enterprise').strip()
 SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
 # 构建标记：每次改完代码手动 +1，/healthz 与 /k 里能看到，用来确认"线上到底跑的是哪一版"
-BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-17.1810'
+BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-26.2000'
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 EPAY_API_URL = os.environ.get('EPAY_API_URL', '').rstrip('/')
 EPAY_PID = os.environ.get('EPAY_PID', '')
@@ -334,8 +334,8 @@ def init_db():
         pass
     c = con.cursor()
     c.executescript('''
-CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,plan TEXT DEFAULT 'free',plan_expires_at TEXT,tokens_used_today INTEGER DEFAULT 0,tokens_reset_date TEXT,balance REAL DEFAULT 0,invite_code TEXT UNIQUE,invited_by INTEGER,is_admin INTEGER DEFAULT 0,is_active INTEGER DEFAULT 1,created_at TEXT DEFAULT CURRENT_TIMESTAMP,last_login TEXT,daily_token_limit INTEGER,custom_rate_limit INTEGER);
-CREATE TABLE IF NOT EXISTS api_keys(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,key_hash TEXT UNIQUE NOT NULL,key_prefix TEXT NOT NULL,name TEXT DEFAULT '',is_active INTEGER DEFAULT 1,rate_limit INTEGER DEFAULT 60,allowed_ips TEXT DEFAULT '',quota_daily INTEGER,created_at TEXT DEFAULT CURRENT_TIMESTAMP,last_used_at TEXT,FOREIGN KEY(user_id) REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,plan TEXT DEFAULT 'free',plan_expires_at TEXT,tokens_used_today INTEGER DEFAULT 0,tokens_reset_date TEXT,balance REAL DEFAULT 0,invite_code TEXT UNIQUE,invited_by INTEGER,is_admin INTEGER DEFAULT 0,is_active INTEGER DEFAULT 1,created_at TEXT DEFAULT CURRENT_TIMESTAMP,last_login TEXT,daily_token_limit INTEGER,custom_rate_limit INTEGER,allowed_models TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS api_keys(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,key_hash TEXT UNIQUE NOT NULL,key_prefix TEXT NOT NULL,name TEXT DEFAULT '',is_active INTEGER DEFAULT 1,rate_limit INTEGER DEFAULT 60,allowed_ips TEXT DEFAULT '',quota_daily INTEGER,created_at TEXT DEFAULT CURRENT_TIMESTAMP,last_used_at TEXT,allowed_models TEXT DEFAULT '',FOREIGN KEY(user_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT,order_no TEXT UNIQUE NOT NULL,user_id INTEGER NOT NULL,plan_id TEXT NOT NULL,amount REAL NOT NULL,payment_method TEXT DEFAULT '',trade_no TEXT DEFAULT '',status TEXT DEFAULT 'pending',paid_at TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(user_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS usage_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,api_key_id INTEGER,tokens_input INTEGER DEFAULT 0,tokens_output INTEGER DEFAULT 0,model TEXT DEFAULT '',endpoint TEXT DEFAULT '',cost REAL DEFAULT 0,duration_ms INTEGER DEFAULT 0,ip_address TEXT DEFAULT '',created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(user_id) REFERENCES users(id));
 CREATE TABLE IF NOT EXISTS tickets(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,title TEXT NOT NULL,content TEXT DEFAULT '',category TEXT DEFAULT 'general',priority TEXT DEFAULT 'normal',status TEXT DEFAULT 'open',created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT,FOREIGN KEY(user_id) REFERENCES users(id));
@@ -348,7 +348,7 @@ CREATE TABLE IF NOT EXISTS invoices(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id
 CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY,value TEXT DEFAULT '',updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS email_activations(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,email TEXT NOT NULL,token TEXT UNIQUE NOT NULL,expires_at TEXT NOT NULL,used_at TEXT,created_at TEXT DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(user_id) REFERENCES users(id));
 ''')
-    for ddl in ['ALTER TABLE users ADD COLUMN daily_token_limit INTEGER','ALTER TABLE users ADD COLUMN custom_rate_limit INTEGER','ALTER TABLE users ADD COLUMN max_api_keys INTEGER DEFAULT 5','ALTER TABLE users ADD COLUMN email_verified_at TEXT','ALTER TABLE api_keys ADD COLUMN quota_daily INTEGER','ALTER TABLE api_keys ADD COLUMN key_plain TEXT']:
+    for ddl in ['ALTER TABLE users ADD COLUMN daily_token_limit INTEGER','ALTER TABLE users ADD COLUMN custom_rate_limit INTEGER','ALTER TABLE users ADD COLUMN max_api_keys INTEGER DEFAULT 5','ALTER TABLE users ADD COLUMN email_verified_at TEXT','ALTER TABLE users ADD COLUMN allowed_models TEXT DEFAULT \'\'','ALTER TABLE api_keys ADD COLUMN quota_daily INTEGER','ALTER TABLE api_keys ADD COLUMN key_plain TEXT','ALTER TABLE api_keys ADD COLUMN allowed_models TEXT DEFAULT \'\'']:
         try: c.execute(ddl)
         except sqlite3.OperationalError: pass
     for ddl in [
@@ -402,24 +402,36 @@ def seed_master_api_key(c):
     不设置该变量时本函数不做任何事。
     """
     raw_keys=[]
+    def _split_key_policy(v):
+        """支持 'sk-xxx|规则' 语法：竖线后面是该 Key 的模型调用白名单（规则间用空格/逗号分隔）。"""
+        if '|' in v:
+            k,pol=v.split('|',1)
+            return k.strip(),' '.join(r for r in re.split(r'[,\s;]+',pol.strip()) if r.strip())
+        return v,''
     for env_name in ('MASTER_API_KEY','STATIC_API_KEY'):
         v=(os.environ.get(env_name) or '').strip()
-        if v: raw_keys.append((v,env_name+' (env)'))
+        if v:
+            k,pol=_split_key_policy(v); raw_keys.append((k,env_name+' (env)',pol))
     # EXTRA_API_KEYS=sk-a,sk-b —— 让后台手工创建的 Key 也能在重新部署后自动重建
     for i,part in enumerate(re.split(r'[,\n;]+', os.environ.get('EXTRA_API_KEYS') or ''),1):
         v=part.strip()
-        if v: raw_keys.append((v,'EXTRA_API_KEYS #%d (env)'%i))
+        if v:
+            k,pol=_split_key_policy(v); raw_keys.append((k,'EXTRA_API_KEYS #%d (env)'%i,pol))
     if not raw_keys: return
     admin=c.execute('SELECT id FROM users WHERE is_admin=1 ORDER BY id ASC LIMIT 1').fetchone()
     if not admin: return
     uid=admin['id']
-    for raw,label in raw_keys:
+    for raw,label,policy in raw_keys:
         key_hash=hashlib.sha256(raw.encode()).hexdigest()
         row=c.execute('SELECT id FROM api_keys WHERE key_hash=?',(key_hash,)).fetchone()
         if row:
-            c.execute('UPDATE api_keys SET is_active=1,key_plain=?,user_id=? WHERE id=?',(raw,uid,row['id']))
+            # 环境变量里显式写了规则（key|rules）就以环境变量为准；没写则不覆盖后台改过的值
+            if policy:
+                c.execute('UPDATE api_keys SET is_active=1,key_plain=?,user_id=?,allowed_models=? WHERE id=?',(raw,uid,policy,row['id']))
+            else:
+                c.execute('UPDATE api_keys SET is_active=1,key_plain=?,user_id=? WHERE id=?',(raw,uid,row['id']))
         else:
-            c.execute('INSERT INTO api_keys(user_id,key_hash,key_prefix,key_plain,name,rate_limit) VALUES(?,?,?,?,?,?)',(uid,key_hash,raw[:10],raw,label,100000))
+            c.execute('INSERT INTO api_keys(user_id,key_hash,key_prefix,key_plain,name,rate_limit,allowed_models) VALUES(?,?,?,?,?,?,?)',(uid,key_hash,raw[:10],raw,label,100000,policy))
     print('[init] %d env API key(s) seeded as always-valid admin keys' % len(raw_keys))
 
 def _upstream_env_present():
@@ -809,7 +821,7 @@ def api_key_candidates():
 def api_auth():
     for raw in api_key_candidates():
         key_hash=hashlib.sha256(raw.encode()).hexdigest()
-        row=db().execute('SELECT k.*,u.plan,u.tokens_used_today,u.tokens_reset_date,u.is_active user_active,u.is_admin user_is_admin,u.daily_token_limit,u.custom_rate_limit FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=? AND k.is_active=1',(key_hash,)).fetchone()
+        row=db().execute('SELECT k.*,u.plan,u.tokens_used_today,u.tokens_reset_date,u.is_active user_active,u.is_admin user_is_admin,u.allowed_models user_allowed_models,u.daily_token_limit,u.custom_rate_limit FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=? AND k.is_active=1',(key_hash,)).fetchone()
         if row and row['user_active']: return row,raw
         if os.environ.get('AUTH_DEBUG'):
             app.logger.warning('AUTH_DEBUG miss: recv_len=%s recv_sha256=%s', len(raw), key_hash)
@@ -1127,6 +1139,49 @@ def start_probe_models(max_workers=None):
 
     threading.Thread(target=worker, name='model-probe', daemon=True).start()
     return True, '已在后台开始测速 %d 个模型（并发 %s），完成后 auto 按实测速度排序，不可用的会临时停用（PROBE_AUTO_DISABLE=%s）' % (len(targets), os.environ.get('PROBE_CONCURRENCY', '4'), '1' if PROBE_AUTO_DISABLE else '0')
+
+# ---------- 模型调用权限（白名单分组）：挂在 Key 上、留空继承用户、用户留空=不限制 ----------
+# 规则语法（逗号/分号分隔，大小写不敏感，支持尾部 * 通配）：
+#   up:上游名   / 上游:上游名   —— 只允许 name 匹配的上游（如 up:amd, up:agnes*）
+#   m:模型id    / 模型:模型id    —— 只允许 model_id / display_name 匹配的模型（如 m:gpt5）
+#   无前缀                       —— 同时尝试匹配模型 id 与上游名（如 gpt5、amd）
+# 例：'up:amd,up:agnes'（上游A、B两家）、'up:C,m:gpt5'（C 家全部 + 各家叫 gpt5 的模型）、'gpt*'
+def key_model_rules(key):
+    """当前 Key 生效的白名单规则列表；空列表 = 不限制。Key 自己的规则优先于用户的。"""
+    raw=''
+    try:
+        if 'allowed_models' in key.keys(): raw=(key['allowed_models'] or '').strip()
+    except Exception: pass
+    if not raw:
+        try:
+            if 'user_allowed_models' in key.keys(): raw=(key['user_allowed_models'] or '').strip()
+        except Exception: pass
+    return [r.strip() for r in re.split(r'[,;\n]+', raw) if r.strip()]
+
+def _rule_hit(rule, value):
+    rule=(rule or '').strip().lower(); value=(value or '').strip().lower()
+    if not rule: return False
+    if rule.endswith('*'): return value.startswith(rule[:-1])
+    return value==rule
+
+def model_allowed_by_rules(rules, provider_row):
+    if not rules: return True
+    name=provider_row['name'] or ''; mid=provider_row['model_id'] or ''; disp=provider_row['display_name'] or ''
+    for rule in rules:
+        low=rule.lower()
+        if low.startswith(('up:','上游:')):
+            if _rule_hit(low.split(':',1)[1], name): return True
+        elif low.startswith(('m:','模型:')):
+            v=low.split(':',1)[1]
+            if _rule_hit(v, mid) or _rule_hit(v, disp): return True
+        else:
+            if _rule_hit(rule, mid) or _rule_hit(rule, disp) or _rule_hit(rule, name): return True
+    return False
+
+def filter_models_by_key_rules(rows, key):
+    rules=key_model_rules(key)
+    if not rules: return rows, False
+    return [r for r in rows if model_allowed_by_rules(rules, r)], True
 
 def candidate_model_rows(requested):
     rows=list(active_model_rows())
@@ -1556,12 +1611,16 @@ def envz():
         if key['daily_token_limit']: lim.append(int(key['daily_token_limit']))
         if key['quota_daily']: lim.append(int(key['quota_daily']))
         limit=int(min(lim))
+        _mr=key_model_rules(key)
         quota={'key_name':key['name'], 'plan':key['plan'], 'is_admin':is_admin,
                'used_today':used, 'limit':limit, 'remaining':max(0,limit-used),
                'unlimited':bool(ADMIN_UNLIMITED and is_admin),
+               'model_policy':'restricted' if _mr else 'unrestricted',
+               'model_rules':_mr,
                'reset_date':today,
                'note':'unlimited=true 表示该 Key 不受每日 token 配额限制（账号是管理员且 ADMIN_UNLIMITED 未关闭）；'
-                      'unlimited=false 时 remaining 归零就会返回 429 Daily token quota exceeded。'}
+                      'unlimited=false 时 remaining 归零就会返回 429 Daily token quota exceeded。'
+                      'model_policy=restricted 时该 Key 只能调用 model_rules 白名单内的模型/上游。'}
     except Exception as e:
         quota={'error':str(e)}
     return jsonify({'ok': True, 'build': BUILD_TAG,
@@ -1944,7 +2003,7 @@ def admin():
             except Exception as e: msg='SMTP 测试失败：'+str(e)
         elif act=='update_user':
             uid=request.form.get('user_id'); new_password=request.form.get('new_password','')
-            con.execute('UPDATE users SET username=?,email=?,plan=?,daily_token_limit=?,custom_rate_limit=?,max_api_keys=?,is_active=?,is_admin=?,plan_expires_at=?,balance=?,tokens_used_today=? WHERE id=?',(request.form.get('username',''),request.form.get('email',''),request.form.get('plan','free'),request.form.get('daily_token_limit') or None,request.form.get('custom_rate_limit') or None,int(request.form.get('max_api_keys') or 5),1 if request.form.get('is_active')=='1' else 0,1 if request.form.get('is_admin')=='1' else 0,request.form.get('plan_expires_at') or None,float(request.form.get('balance') or 0),int(request.form.get('tokens_used_today') or 0),uid))
+            con.execute('UPDATE users SET username=?,email=?,plan=?,daily_token_limit=?,custom_rate_limit=?,max_api_keys=?,is_active=?,is_admin=?,plan_expires_at=?,balance=?,tokens_used_today=?,allowed_models=? WHERE id=?',(request.form.get('username',''),request.form.get('email',''),request.form.get('plan','free'),request.form.get('daily_token_limit') or None,request.form.get('custom_rate_limit') or None,int(request.form.get('max_api_keys') or 5),1 if request.form.get('is_active')=='1' else 0,1 if request.form.get('is_admin')=='1' else 0,request.form.get('plan_expires_at') or None,float(request.form.get('balance') or 0),int(request.form.get('tokens_used_today') or 0),request.form.get('allowed_models','').strip(),uid))
             if new_password:
                 if len(new_password) < 6: msg='密码至少 6 位'
                 else: con.execute('UPDATE users SET password_hash=? WHERE id=?',(generate_password_hash(new_password),uid)); msg='用户配置和密码已更新'
@@ -1958,7 +2017,7 @@ def admin():
         elif act=='reset_user_usage':
             uid=request.form.get('user_id'); con.execute('UPDATE users SET tokens_used_today=0,tokens_reset_date=? WHERE id=?',(dt.date.today().isoformat(),uid)); con.execute('DELETE FROM usage_logs WHERE user_id=?',(uid,)); con.commit(); msg='用户用量与日志已清理'
         elif act=='update_key':
-            con.execute('UPDATE api_keys SET name=?,is_active=?,rate_limit=?,quota_daily=?,allowed_ips=? WHERE id=?',(request.form.get('name',''),1 if request.form.get('is_active')=='1' else 0,int(request.form.get('rate_limit') or 60),request.form.get('quota_daily') or None,request.form.get('allowed_ips',''),request.form.get('key_id'))); con.commit(); msg='API Key 配置已更新'
+            con.execute('UPDATE api_keys SET name=?,is_active=?,rate_limit=?,quota_daily=?,allowed_ips=?,allowed_models=? WHERE id=?',(request.form.get('name',''),1 if request.form.get('is_active')=='1' else 0,int(request.form.get('rate_limit') or 60),request.form.get('quota_daily') or None,request.form.get('allowed_ips',''),request.form.get('allowed_models','').strip(),request.form.get('key_id'))); con.commit(); msg='API Key 配置已更新'
         elif act=='delete_key':
             kid=request.form.get('key_id'); con.execute('DELETE FROM usage_logs WHERE api_key_id=?',(kid,)); con.execute('DELETE FROM api_keys WHERE id=?',(kid,)); con.commit(); msg='API Key 及关联日志已删除'
         elif act=='mark_paid':
@@ -2090,8 +2149,8 @@ def admin():
     def yn(name,val): return f'<select name="{name}" class="input mini"><option value="1" {sel(val,1)}>启用</option><option value="0" {sel(val,0)}>禁用</option></select>'
     def plan_opts(cur): return ''.join([f'<option value="{h(pid)}" {sel(cur,pid)}>{h(pid)}</option>' for pid in get_plan_config(True).keys()])
     users=con.execute('SELECT * FROM users ORDER BY id DESC LIMIT 100').fetchall(); keys=con.execute('SELECT k.*,u.username FROM api_keys k JOIN users u ON u.id=k.user_id ORDER BY k.id DESC LIMIT 100').fetchall(); orders=con.execute('SELECT o.*,u.username FROM orders o JOIN users u ON u.id=o.user_id ORDER BY o.id DESC LIMIT 100').fetchall(); tickets=con.execute('SELECT t.*,u.username FROM tickets t JOIN users u ON u.id=t.user_id ORDER BY t.id DESC LIMIT 50').fetchall(); plans_rows=con.execute('SELECT * FROM plans ORDER BY sort_order ASC,price ASC,id ASC').fetchall(); projects=con.execute('SELECT * FROM managed_projects ORDER BY sort_order ASC,id DESC').fetchall(); model_rows=con.execute('SELECT * FROM model_providers ORDER BY is_default DESC,sort_order ASC,id ASC').fetchall(); usage=con.execute('SELECT u.username,sum(l.tokens_input+l.tokens_output) total_tokens,count(*) calls,max(l.created_at) last_at FROM usage_logs l JOIN users u ON u.id=l.user_id GROUP BY l.user_id ORDER BY total_tokens DESC LIMIT 20').fetchall()
-    uh=''.join([f'<tr><td>{x["id"]}</td><td><form method="post"><input type="hidden" name="act" value="update_user"><input type="hidden" name="user_id" value="{x["id"]}"><input class="input mini" name="username" value="{h(x["username"])}"><input class="input" name="email" value="{h(x["email"])}"><input class="input" type="password" name="new_password" placeholder="新密码，留空不改"></td><td><select name="plan" class="input mini">{plan_opts(x["plan"])}</select></td><td><input class="input mini" name="daily_token_limit" value="{h(x["daily_token_limit"] or "")}" placeholder="tokens/日"><br><input class="input mini" name="custom_rate_limit" value="{h(x["custom_rate_limit"] or "")}" placeholder="RPM"><br><input class="input mini" name="max_api_keys" value="{h(x["max_api_keys"] or 5)}" placeholder="Key数量"></td><td><input class="input" name="plan_expires_at" value="{h(x["plan_expires_at"] or "")}"></td><td><input class="input mini" name="balance" value="{h(x["balance"])}"></td><td>{yn("is_active",x["is_active"])}{yn("is_admin",x["is_admin"])}</td><td><input class="input mini" name="tokens_used_today" value="{h(x["tokens_used_today"])}"></td><td><button class="btn">保存</button></form><form method="post"><input type="hidden" name="act" value="reset_user_usage"><input type="hidden" name="user_id" value="{x["id"]}"><button class="btn btn2">清用量</button></form><form method="post"><input type="hidden" name="act" value="delete_user"><input type="hidden" name="user_id" value="{x["id"]}"><button class="btn btn-danger">删除</button></form></td></tr>' for x in users])
-    kh=''.join([f'<tr><td>{k["id"]}</td><td>{h(k["username"])}</td><td><form method="post"><input type="hidden" name="act" value="update_key"><input type="hidden" name="key_id" value="{k["id"]}"><input class="input mini" name="name" value="{h(k["name"])}"><br><span class="muted">{h(k["key_prefix"])}...</span></td><td>{yn("is_active",k["is_active"])}</td><td><input class="input mini" name="rate_limit" value="{h(k["rate_limit"])}"></td><td><input class="input mini" name="quota_daily" value="{h(k["quota_daily"] or "")}"></td><td><input class="input" name="allowed_ips" value="{h(k["allowed_ips"] or "")}"></td><td>{h(k["last_used_at"] or "-")}</td><td><button class="btn">保存</button></form><form method="post"><input type="hidden" name="act" value="delete_key"><input type="hidden" name="key_id" value="{k["id"]}"><button class="btn btn-danger">删除</button></form></td></tr>' for k in keys]) or '<tr><td colspan="9">暂无 API Key</td></tr>'
+    uh=''.join([f'<tr><td>{x["id"]}</td><td><form method="post"><input type="hidden" name="act" value="update_user"><input type="hidden" name="user_id" value="{x["id"]}"><input class="input mini" name="username" value="{h(x["username"])}"><input class="input" name="email" value="{h(x["email"])}"><input class="input" type="password" name="new_password" placeholder="新密码，留空不改"></td><td><select name="plan" class="input mini">{plan_opts(x["plan"])}</select></td><td><input class="input mini" name="daily_token_limit" value="{h(x["daily_token_limit"] or "")}" placeholder="tokens/日"><br><input class="input mini" name="custom_rate_limit" value="{h(x["custom_rate_limit"] or "")}" placeholder="RPM"><br><input class="input mini" name="max_api_keys" value="{h(x["max_api_keys"] or 5)}" placeholder="Key数量"></td><td><input class="input" name="plan_expires_at" value="{h(x["plan_expires_at"] or "")}"></td><td><input class="input mini" name="balance" value="{h(x["balance"])}"></td><td><input class="input" name="allowed_models" value="{h(x["allowed_models"] or "")}" placeholder="留空=不限制，如 up:amd,up:agnes"></td><td>{yn("is_active",x["is_active"])}{yn("is_admin",x["is_admin"])}</td><td><input class="input mini" name="tokens_used_today" value="{h(x["tokens_used_today"])}"></td><td><button class="btn">保存</button></form><form method="post"><input type="hidden" name="act" value="reset_user_usage"><input type="hidden" name="user_id" value="{x["id"]}"><button class="btn btn2">清用量</button></form><form method="post"><input type="hidden" name="act" value="delete_user"><input type="hidden" name="user_id" value="{x["id"]}"><button class="btn btn-danger">删除</button></form></td></tr>' for x in users])
+    kh=''.join([f'<tr><td>{k["id"]}</td><td>{h(k["username"])}</td><td><form method="post"><input type="hidden" name="act" value="update_key"><input type="hidden" name="key_id" value="{k["id"]}"><input class="input mini" name="name" value="{h(k["name"])}"><br><span class="muted">{h(k["key_prefix"])}...</span></td><td>{yn("is_active",k["is_active"])}</td><td><input class="input mini" name="rate_limit" value="{h(k["rate_limit"])}"></td><td><input class="input mini" name="quota_daily" value="{h(k["quota_daily"] or "")}"></td><td><input class="input" name="allowed_ips" value="{h(k["allowed_ips"] or "")}"></td><td><input class="input" name="allowed_models" value="{h(k["allowed_models"] or "")}" placeholder="留空=继承用户"></td><td>{h(k["last_used_at"] or "-")}</td><td><button class="btn">保存</button></form><form method="post"><input type="hidden" name="act" value="delete_key"><input type="hidden" name="key_id" value="{k["id"]}"><button class="btn btn-danger">删除</button></form></td></tr>' for k in keys]) or '<tr><td colspan="9">暂无 API Key</td></tr>'
     oh=''.join([f'<tr><td>{o["id"]}</td><td>{h(o["order_no"])}</td><td>{h(o["username"])}</td><td><form method="post"><input type="hidden" name="act" value="update_order"><input type="hidden" name="order_id" value="{o["id"]}"><input class="input mini" name="plan_id" value="{h(o["plan_id"])}"></td><td><input class="input mini" name="amount" value="{h(o["amount"])}"></td><td><select class="input mini" name="payment_method"><option value="alipay" {sel(o["payment_method"],"alipay")}>支付宝</option><option value="wxpay" {sel(o["payment_method"],"wxpay")}>微信</option><option value="manual" {sel(o["payment_method"],"manual")}>手动</option></select></td><td><input class="input mini" name="trade_no" value="{h(o["trade_no"] or "")}"></td><td><select class="input mini" name="status"><option value="pending" {sel(o["status"],"pending")}>pending</option><option value="paid" {sel(o["status"],"paid")}>paid</option><option value="cancelled" {sel(o["status"],"cancelled")}>cancelled</option><option value="refunded" {sel(o["status"],"refunded")}>refunded</option></select></td><td><input class="input" name="paid_at" value="{h(o["paid_at"] or "")}"></td><td><button class="btn">保存</button></form><form method="post"><input type="hidden" name="act" value="mark_paid"><input type="hidden" name="order_id" value="{o["id"]}"><button class="btn btn2">确认支付</button></form><form method="post"><input type="hidden" name="act" value="delete_order"><input type="hidden" name="order_id" value="{o["id"]}"><button class="btn btn-danger">删除</button></form></td></tr>' for o in orders]) or '<tr><td colspan="10">暂无订单</td></tr>'
     th=[]
     for t in tickets:
@@ -2171,8 +2230,8 @@ def admin():
 {openai_compat_docs_html(st.get('public_base_url') or PUBLIC_BASE_URL)}{bulk_section}{probe_section}<h3>模型配置管理（三方 OpenAI 兼容/Ollama 中转）</h3><p class="muted">OpenAI 兼容供应商支持填写 Base URL + API Key 后自动请求 <code>/models</code> 批量导入模型 ID；多模态能力请按上游真实能力勾选，网关会据此做路由过滤。</p>{discover_form}<table width="100%"><tr><th>ID</th><th>名称/协议</th><th>类型</th><th>Base URL/扩展</th><th>API Key</th><th>模型ID/显示名</th><th>状态</th><th>能力</th><th>排序/超时/Token</th><th>操作</th></tr>{model_html}{new_model}</table>
 <h3>套餐 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>价格</th><th>日额度</th><th>RPM</th><th>天数</th><th>状态</th><th>排序</th><th>说明</th><th>操作</th></tr>{plan_html}{new_plan}</table>
 <h3>管理项目 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>Slug</th><th>说明</th><th>链接</th><th>状态</th><th>排序</th><th>操作</th></tr>{proj_html}{new_proj}</table>
-<h3>用户 / 套餐 / 额度</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>套餐</th><th>自定义额度 / Key数</th><th>到期</th><th>余额</th><th>状态</th><th>今日已用</th><th>操作</th></tr>{uh}</table>
-<h3>API Key 管理</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>Key</th><th>状态</th><th>RPM</th><th>Key日额度</th><th>IP白名单</th><th>最后使用</th><th>操作</th></tr>{kh}</table>
+<h3>用户 / 套餐 / 额度</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>套餐</th><th>自定义额度 / Key数</th><th>到期</th><th>余额</th><th>模型权限</th><th>状态</th><th>今日已用</th><th>操作</th></tr>{uh}</table>
+<h3>API Key 管理</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>Key</th><th>状态</th><th>RPM</th><th>Key日额度</th><th>IP白名单</th><th>模型权限</th><th>最后使用</th><th>操作</th></tr>{kh}</table>
 <h3>订单管理</h3><table width="100%"><tr><th>ID</th><th>订单号</th><th>用户</th><th>套餐</th><th>金额</th><th>方式</th><th>交易号</th><th>状态</th><th>支付时间</th><th>操作</th></tr>{oh}</table>
 <h3>工单管理</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>内容/最近消息</th><th>分类</th><th>优先级</th><th>状态/回复</th></tr>{th}</table>
 <h3>用量排行</h3><form method="post"><input type="hidden" name="act" value="clear_usage_logs"><button class="btn btn-danger">清理全部调用日志/重置今日用量</button></form><table width="100%"><tr><th>用户</th><th>调用次数</th><th>总 Tokens</th><th>最后调用</th></tr>{usage_html}</table></div>'''
@@ -2203,10 +2262,12 @@ def key_path_helper():
 
 @app.route('/v1/models')
 def models():
-    if (os.environ.get('MODELS_REQUIRE_AUTH') or '').strip().lower() in ('1','true','yes','on') and not api_auth()[0]:
+    key,_=api_auth()
+    if (os.environ.get('MODELS_REQUIRE_AUTH') or '').strip().lower() in ('1','true','yes','on') and not key:
         return jsonify({'error':{'message':'Unauthorized: missing/invalid API key','type':'auth_error'}}),401
     data=[]
-    for m in active_model_rows(): data.append({'id':m['display_name'] or m['model_id'],'object':'model','created':int(time.time()),'owned_by':m['name'],'provider_type':m['provider_type'],'endpoint_type':get_provider_endpoint_type(m),'capabilities':{'modalities':sorted(get_provider_modalities(m)),'stream':bool(m['supports_stream']),'tools':bool(m['supports_tools']),'max_input_tokens':m['max_input_tokens'],'max_output_tokens':m['max_output_tokens']}})
+    _mrows,_restricted=filter_models_by_key_rules(active_model_rows(), key) if key else (active_model_rows(), False)
+    for m in _mrows: data.append({'id':m['display_name'] or m['model_id'],'object':'model','created':int(time.time()),'owned_by':m['name'],'provider_type':m['provider_type'],'endpoint_type':get_provider_endpoint_type(m),'capabilities':{'modalities':sorted(get_provider_modalities(m)),'stream':bool(m['supports_stream']),'tools':bool(m['supports_tools']),'max_input_tokens':m['max_input_tokens'],'max_output_tokens':m['max_output_tokens']}})
     resp=jsonify({'object':'list','data':data})
     resp.headers['Cache-Control']='no-store, no-cache, must-revalidate, max-age=0'
     resp.headers['Pragma']='no-cache'
@@ -2229,6 +2290,22 @@ def run_gateway_request(payload, target_api='chat_completions'):
     requested=payload.get('model')
     raw_candidates=candidate_model_rows(requested)
     if not raw_candidates: return jsonify({'error':{'message':'No active model provider configured','type':'model_error','code':'unsupported_model'}}),502
+    # 模型调用权限（白名单分组）：把 Key/用户不允许的模型从候选里剔除。
+    # 显式指定的模型"存在但不在白名单"时返回 403（权限语义要明确，不能悄悄换模型替答）。
+    _rules=key_model_rules(key)
+    if _rules:
+        _req_s=(requested or '').strip()
+        _auto_like=(not _req_s) or _req_s.lower() in ('auto','auto:fallback','fallback')
+        _filtered=[r for r in raw_candidates if model_allowed_by_rules(_rules, r)]
+        if not _auto_like:
+            # 显式指定的模型"存在但不在白名单"→ 403（权限语义要明确，不能悄悄换模型替答）
+            _exact_exists=any(_req_s in (r['model_id'], r['display_name'], r['name']) for r in active_model_rows())
+            _exact_still=any(_req_s in (r['model_id'], r['display_name'], r['name']) for r in _filtered)
+            if _exact_exists and not _exact_still:
+                return jsonify({'error':{'message':'当前 API Key 无权调用该模型（模型调用权限限制）','type':'permission_error','code':'model_not_allowed','requested_model':requested,'allowed_rules':_rules}}),403
+        raw_candidates=_filtered
+        if not raw_candidates:
+            return jsonify({'error':{'message':'当前 API Key 未被授权调用任何模型','type':'permission_error','code':'model_not_allowed','allowed_rules':_rules}}),403
     endpoint_types=None
     if target_api=='messages':
         # Try anthropic_messages models first, fall back to chat_completions for auto/any model
