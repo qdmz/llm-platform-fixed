@@ -37,7 +37,7 @@ ADMIN_UNLIMITED = (os.environ.get('ADMIN_UNLIMITED') or '1').strip().lower() not
 ADMIN_PLAN = (os.environ.get('ADMIN_PLAN') or 'enterprise').strip()
 SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
 # 构建标记：每次改完代码手动 +1，/healthz 与 /k 里能看到，用来确认"线上到底跑的是哪一版"
-BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-26.2000'
+BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-28.1030'
 SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
 EPAY_API_URL = os.environ.get('EPAY_API_URL', '').rstrip('/')
 EPAY_PID = os.environ.get('EPAY_PID', '')
@@ -46,11 +46,11 @@ DOMAIN = os.environ.get('DOMAIN', 'newapi.ypvps.com')
 PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', f'https://{DOMAIN}')
 
 PLAN_CONFIG = {
-    'free': {'name': '免费版', 'price': 0, 'daily_tokens': 10000, 'rate_limit': 20, 'days': 3650, 'description': '免费体验'},
-    'starter': {'name': '入门版', 'price': 1, 'daily_tokens': 200000, 'rate_limit': 60, 'days': 30, 'description': '个人轻量调用'},
-    'pro': {'name': '专业版', 'price': 2, 'daily_tokens': 1000000, 'rate_limit': 180, 'days': 30, 'description': '生产项目推荐'},
-    'enterprise': {'name': '企业版', 'price': 3, 'daily_tokens': 5000000, 'rate_limit': 600, 'days': 30, 'description': '团队与高并发'},
-    'yearly': {'name': '年付专业版', 'price': 9, 'daily_tokens': 1500000, 'rate_limit': 240, 'days': 365, 'description': '年付优惠'},
+    'free': {'name': '免费版', 'price': 0, 'daily_tokens': 1000000, 'rate_limit': 20, 'days': 3650, 'description': '免费体验'},
+    'starter': {'name': '入门版', 'price': 1, 'daily_tokens': 20000000, 'rate_limit': 60, 'days': 30, 'description': '个人轻量调用'},
+    'pro': {'name': '专业版', 'price': 2, 'daily_tokens': 100000000, 'rate_limit': 180, 'days': 30, 'description': '生产项目推荐'},
+    'enterprise': {'name': '企业版', 'price': 3, 'daily_tokens': 500000000, 'rate_limit': 600, 'days': 30, 'description': '团队与高并发'},
+    'yearly': {'name': '年付专业版', 'price': 9, 'daily_tokens': 150000000, 'rate_limit': 240, 'days': 365, 'description': '年付优惠'},
 }
 
 # 套餐默认值可以用环境变量覆盖（容器盘是临时的，每次重新部署都要重建数据库，
