@@ -6,18 +6,16 @@
 
 ## 功能特性
 
-- OpenAI 兼容接口：
-  - `GET /v1/models`
-  - `POST /v1/chat/completions`
-- 用户系统：注册、登录、控制台、API Key 管理。
-- 邮箱激活：注册必须填写邮箱，发送激活邮件，点击 `/activate?token=...` 后激活账号。
-- SMTP 后台配置：支持 Host、端口、TLS/SSL、账号、授权码、发件邮箱、测试邮件。
-- 第三方模型中转：支持 OpenAI-compatible Base URL + API Key。
-- 自动读取模型：后台可通过供应商 `/v1/models` 自动批量导入模型 ID。
-- 自动故障切换：`model` 为空或填写 `auto` 时，按后台优先级自动尝试可用模型；指定模型失败时也会继续 fallback 到其它启用模型。
-- 本地 Ollama：支持本地 `qwen2.5-coder-14b-ms:latest` 等模型。
-- 商业化能力：套餐、余额、订单、易支付回调、发票、工单。
-- SQLite 持久化，部署简单。
+- **多协议 OpenAI 兼容网关**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`、`/v1/messages`（Anthropic），上游可以是 OpenAI Chat / OpenAI Responses / Anthropic Messages / Ollama，网关在协议之间自动转换请求和响应（含流式 SSE）。
+- **auto 智能选路**：`model` 为空或 `auto` 时按实测速度选最快的可用模型，失败、超时、空回复自动换下一个候选；流式请求在首字节前同样可重试。
+- **测速与自动启停**：后台一键测速，不可用的模型临时停用、测通后自动恢复。
+- **模型调用权限**：用户 / Key 级白名单（`up:上游名`、`m:模型id`、通配 `*`）。
+- **用户系统**：注册、邮箱激活、登录、控制台、API Key 创建 / 复制 / 停用 / 重新生成 / 删除。
+- **商业化**：套餐、每日 token 额度、限速、订单、易支付回调、工单、发票。
+- **管理后台**：概览仪表盘（用户、调用量、收入、热门模型）+ 分页签管理模型、测速、用户与 Key、套餐与订单、工单、系统设置。
+- **响应式卡片界面**：桌面 / 平板 / 手机自适应，深色模式，代码块一键复制，危险操作二次确认。
+- **安全加固**：CSRF 防护、登录失败限流、会话密钥持久化、支付回调金额校验与幂等。
+- SQLite 持久化，单文件 Flask，部署简单；支持 systemd、Docker、各类 PaaS。
 
 ## 项目结构
 
@@ -33,7 +31,10 @@
 ├── pull-modelscope.sh      # 本地模型拉取辅助脚本
 ├── .env.example            # 环境变量示例，禁止提交真实 .env
 ├── DEPLOY.md               # 部署说明
-└── README.md               # 项目说明
+├── README.md               # 项目说明
+├── CHANGELOG.md            # 版本变更记录
+├── VERSION                 # 当前版本号
+└── scripts/release.sh      # 自动递增版本号、打 tag 并推送
 ```
 
 ## 快速本地运行
@@ -66,6 +67,23 @@ curl http://127.0.0.1:5088/health
 ```
 
 更多说明见 [DOCKER.md](./DOCKER.md)。
+
+## 新增环境变量
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SESSION_COOKIE_SECURE` | `0` | 设为 `1` 时会话 Cookie 只走 HTTPS |
+| `LOGIN_MAX_FAILS` | `8` | 同一 IP 10 分钟内允许的登录失败次数 |
+| `FLASK_SECRET_KEY` | 自动生成并持久化 | 会话签名密钥 |
+
+## 版本发布
+
+```bash
+# 自动把 VERSION 的补丁号 +1，更新 CHANGELOG 标题、提交、打 tag 并推送
+bash scripts/release.sh            # 1.0.0 -> 1.0.1
+bash scripts/release.sh minor      # 1.0.1 -> 1.1.0
+bash scripts/release.sh major      # 1.1.0 -> 2.0.0
+```
 
 ## 生产部署
 
@@ -103,22 +121,37 @@ curl https://newapi.example.com/v1/chat/completions \
   }'
 ```
 
+## 页面一览
+
+| 路径 | 说明 |
+| --- | --- |
+| `/` | 首页：模型广场、套餐价格、快速接入 |
+| `/register` `/login` | 注册 / 登录（登录失败 10 分钟内超过 `LOGIN_MAX_FAILS` 次会被临时限制） |
+| `/dashboard` | 用户控制台：套餐与额度、近 7 天用量、最近调用、API Key、订单、工单 |
+| `/playground` | 在线聊天测试，`Ctrl/⌘ + Enter` 发送 |
+| `/admin` | 管理后台（概览 / 模型与上游 / 测速 / 用户与 Key / 套餐与订单 / 工单 / 系统设置 / 接入文档） |
+| `/health` `/healthz` `/envz` | 健康检查与环境自检 |
+
 ## 管理后台
 
 访问：`/admin`
 
-后台可配置：
+- **概览**：用户数、启用模型、今日调用与 tokens、累计收入、近 14 天调用趋势、热门模型。
+- **模型与上游**：按上游批量换 Key / Base URL / 启停 / 重命名；通过 `/v1/models` 自动导入；多模态能力识别。
+- **测速 / 智能选路**：一键测速、查看最快模型和连续失败模型、恢复自动停用。
+- **用户与 Key**：套餐、额度、限速、模型权限、IP 白名单。
+- **套餐与订单**：套餐 CRUD、订单管理、易支付配置（回调 `/payment/notify`，跳转 `/payment/success`）。
+- **工单**、**系统设置**（SMTP、项目、用量日志）、**接入文档**。
 
-- 易支付：`/payment/notify`、`/payment/success`
-- SMTP 邮件
-- 第三方 OpenAI 兼容模型
-- 本地 Ollama 模型
-- 套餐、用户、工单、发票
+使用默认密码 `admin123` 登录时，后台顶部会显示安全提醒。
 
 ## 安全注意事项
 
 - 不要提交真实 `.env`、数据库、日志、模型文件。
-- 首次部署必须修改 `ADMIN_PASSWORD` 和 `FLASK_SECRET_KEY`。
+- 首次部署必须修改 `ADMIN_PASSWORD`；`FLASK_SECRET_KEY` 未设置时会自动生成并保存到 `data/.flask_secret_key`，重启和多 worker 下登录态保持不变。
+- 所有页面表单带 CSRF 校验；`/v1/*` API 与支付回调不受影响。
+- 全站 HTTPS 时建议设置 `SESSION_COOKIE_SECURE=1`。
+- 易支付回调会校验签名（常量时间比较）和金额，重复回调幂等处理，不会重复延长套餐。
 - SMTP 授权码、第三方 API Key、易支付密钥只在后台或服务器 `.env` 配置。
 - QQ 邮箱 `smtp.qq.com:465` 使用 SSL；程序已对 465 端口自动按 SSL 处理。
 

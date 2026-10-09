@@ -37,8 +37,30 @@ ADMIN_UNLIMITED = (os.environ.get('ADMIN_UNLIMITED') or '1').strip().lower() not
 ADMIN_PLAN = (os.environ.get('ADMIN_PLAN') or 'enterprise').strip()
 SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
 # 构建标记：每次改完代码手动 +1，/healthz 与 /k 里能看到，用来确认"线上到底跑的是哪一版"
-BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-09-28.1030'
-SECRET_KEY = os.environ.get('FLASK_SECRET_KEY') or secrets.token_hex(32)
+BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-10-09.1300'
+def _load_secret_key():
+    """FLASK_SECRET_KEY 未设置时持久化到数据目录，避免重启/多 worker 导致所有用户被登出。"""
+    env=(os.environ.get('FLASK_SECRET_KEY') or '').strip()
+    if env: return env
+    path=os.path.join(DATA_DIR, '.flask_secret_key')
+    try:
+        if os.path.exists(path):
+            with open(path) as f:
+                v=f.read().strip()
+                if v: return v
+        os.makedirs(DATA_DIR, exist_ok=True)
+        v=secrets.token_hex(32)
+        with open(path,'w') as f: f.write(v)
+        try: os.chmod(path,0o600)
+        except OSError: pass
+        return v
+    except OSError:
+        return secrets.token_hex(32)
+SECRET_KEY = _load_secret_key()
+SESSION_COOKIE_SECURE = (os.environ.get('SESSION_COOKIE_SECURE') or '0').strip().lower() in ('1','true','yes','on')
+LOGIN_MAX_FAILS = int(os.environ.get('LOGIN_MAX_FAILS', '8') or 8)          # 同一 IP 10 分钟内最多失败次数
+if ADMIN_PASSWORD in ('admin123', 'change-me', ''):
+    print('[security] 警告：ADMIN_PASSWORD 仍是默认/示例值，请通过环境变量设置强密码，并登录后台修改。')
 EPAY_API_URL = os.environ.get('EPAY_API_URL', '').rstrip('/')
 EPAY_PID = os.environ.get('EPAY_PID', '')
 EPAY_KEY = os.environ.get('EPAY_KEY', '')
@@ -122,7 +144,7 @@ def plan_config_from_env():
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
-app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=False)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=SESSION_COOKIE_SECURE, PERMANENT_SESSION_LIFETIME=dt.timedelta(days=7))
 CORS(app)
 
 class KeyPathMiddleware:
@@ -172,36 +194,51 @@ def no_cache_dynamic_pages(resp):
         resp.headers['Expires'] = '0'
     return resp
 
-HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{{site_name}} · OpenAI 兼容大模型网关</title><style>
-:root{--bg:#f4f5f9;--card:#fff;--line:#e9ebf2;--text:#1f2329;--muted:#8b93a5;--primary:#5b5bd6;--primary2:#8257e6;--ok:#12b76a;--bad:#f04438;--warn:#f79009;--radius:14px}
+HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#5b5bd6"><title>{{site_name}} · OpenAI 兼容大模型网关</title>
+<script>(function(){try{var t=localStorage.getItem('lp_theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.setAttribute('data-theme','dark');}catch(e){}})();</script>
+<style>
+:root{--bg:#f4f5f9;--card:#fff;--card2:#fafbfd;--soft:#f2f3f8;--line:#e9ebf2;--line2:#f2f3f8;--text:#1f2329;--text2:#4b5563;--muted:#8b93a5;--primary:#5b5bd6;--primary2:#8257e6;--primary-soft:#eef0ff;--ok:#12b76a;--ok-soft:#e8f8ef;--bad:#f04438;--bad-soft:#fff1f0;--warn:#f79009;--warn-soft:#fff7e6;--radius:14px;--shadow:0 1px 2px rgba(16,24,40,.04),0 1px 3px rgba(16,24,40,.03);--shadow-lg:0 12px 32px rgba(16,24,40,.08)}
+[data-theme=dark]{--bg:#0f1117;--card:#171a23;--card2:#1c2030;--soft:#222739;--line:#2a2f42;--line2:#232838;--text:#e6e8ef;--text2:#b7bdcc;--muted:#8a91a6;--primary:#7c7cf0;--primary2:#9b74f2;--primary-soft:#262a4a;--ok:#32d583;--ok-soft:#173326;--bad:#f97066;--bad-soft:#3a1d1d;--warn:#fdb022;--warn-soft:#3a2d14;--shadow:none;--shadow-lg:0 12px 32px rgba(0,0,0,.35)}
 *{box-sizing:border-box}
 html,body{margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.65;-webkit-font-smoothing:antialiased}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.65;-webkit-font-smoothing:antialiased;transition:background .2s}
 a{color:var(--primary);text-decoration:none}a:hover{opacity:.85}
-h1,h2,h3,h4{margin:0 0 12px;line-height:1.3}h1{font-size:30px}h2{font-size:21px}h3{font-size:16px}h4{font-size:14px}
-p{margin:0 0 10px}
+h1,h2,h3,h4{margin:0 0 12px;line-height:1.3}h1{font-size:30px}h2{font-size:21px}h3{font-size:16px}h4{font-size:14px;margin-top:14px}
+p{margin:0 0 10px}ul{padding-left:20px}
 /* top nav */
-.topbar{position:sticky;top:0;z-index:50;background:rgba(255,255,255,.9);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.topbar{position:sticky;top:0;z-index:50;background:color-mix(in srgb,var(--card) 88%,transparent);backdrop-filter:saturate(1.6) blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
 .topbar-inner{max-width:1240px;margin:0 auto;padding:0 20px;height:62px;display:flex;align-items:center;gap:18px}
 .brand{display:flex;align-items:center;gap:10px;color:var(--text);font-weight:700;flex:none}
 .brand-logo{width:34px;height:34px;border-radius:10px;background:linear-gradient(135deg,var(--primary),var(--primary2));color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;letter-spacing:.5px;box-shadow:0 4px 12px rgba(91,91,214,.35)}
 .brand-text{display:flex;flex-direction:column;line-height:1.1}
 .brand-text small{color:var(--muted);font-weight:400;font-size:11px}
 .menu{display:flex;align-items:center;gap:2px;flex:1;flex-wrap:wrap}
-.menu a{color:#4b5563;padding:7px 12px;border-radius:9px;font-size:13.5px}
-.menu a:hover{background:#f1f2f8;color:var(--text);opacity:1}
+.menu a{color:var(--text2);padding:7px 12px;border-radius:9px;font-size:13.5px}
+.menu a:hover{background:var(--soft);color:var(--text);opacity:1}
+.menu a.active{background:var(--primary-soft);color:var(--primary);font-weight:600}
 .user-chip{display:flex;align-items:center;gap:10px;font-size:13px;flex:none}
 .avatar{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,var(--primary2),var(--primary));color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700}
-.user-chip a{color:var(--muted)}
+.user-chip a:not(.btn){color:var(--muted)}
+.hero .bad{color:#fecaca}.hero .ok{color:#bbf7d0}
+.icon-btn{width:34px;height:34px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--text2);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;font-size:16px;flex:none}
+.icon-btn:hover{background:var(--soft)}
+.nav-toggle{display:none}
 /* layout */
 .wrap{max-width:1240px;margin:0 auto;padding:22px 20px 8px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
+.grid-4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:16px}
 .two{display:grid;grid-template-columns:1.05fr .95fr;gap:16px;align-items:start}
-.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px;box-shadow:0 1px 2px rgba(16,24,40,.04);margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);margin-bottom:16px;min-width:0}
 .card>h3:first-child,.card>h2:first-child{margin-top:0}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.card-head h2,.card-head h3{margin:0}
 .muted{color:var(--muted)}
 .ok{color:var(--ok);font-weight:600}.bad{color:var(--bad);font-weight:600}
+.alert{border-radius:12px;padding:11px 14px;margin-bottom:14px;border:1px solid var(--line);background:var(--card2)}
+.alert-ok{background:var(--ok-soft);border-color:transparent;color:var(--ok)}
+.alert-bad{background:var(--bad-soft);border-color:transparent;color:var(--bad)}
+.alert-warn{background:var(--warn-soft);border-color:transparent;color:var(--warn)}
 /* hero */
 .hero{position:relative;overflow:hidden;background:linear-gradient(135deg,#4f46e5 0%,#6d5ce7 45%,#8b5cf6 100%);color:#fff;border-radius:20px;padding:40px 36px 32px;box-shadow:0 18px 40px rgba(79,70,229,.28);margin-bottom:20px}
 .hero:after{content:"";position:absolute;right:-90px;top:-120px;width:340px;height:340px;border-radius:50%;background:rgba(255,255,255,.14)}
@@ -211,77 +248,229 @@ p{margin:0 0 10px}
 .hero-tag{display:inline-block;background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.28);border-radius:999px;padding:4px 12px;font-size:12px;margin-bottom:14px;position:relative;z-index:1}
 .hero-actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:16px;position:relative;z-index:1}
 .hero-stats{display:flex;gap:28px;flex-wrap:wrap;margin-top:26px;position:relative;z-index:1}
-.hero-stats div{display:flex;flex-direction:column}
-.hero-stats b{font-size:23px;font-weight:800}
+.hero-stats div{display:flex;flex-direction:column;min-width:0}
+.hero-stats b{font-size:23px;font-weight:800;word-break:break-all}
 .hero-stats span{opacity:.85;font-size:12.5px}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;border-radius:10px;background:var(--primary);color:#fff;padding:9px 16px;text-decoration:none;cursor:pointer;font-size:13.5px;font-weight:500;transition:.15s}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;border:0;border-radius:10px;background:var(--primary);color:#fff;padding:9px 16px;text-decoration:none;cursor:pointer;font-size:13.5px;font-weight:500;transition:.15s;white-space:nowrap;font-family:inherit}
 .btn:hover{filter:brightness(1.06)}
+.btn:disabled{opacity:.6;cursor:not-allowed}
 .btn-light{background:#fff;color:#4f46e5;font-weight:600}
 .btn-ghost{background:rgba(255,255,255,.14);color:#fff;border:1px solid rgba(255,255,255,.4)}
-.btn2{background:#fff;color:#4b5563;border:1px solid var(--line)}
-.btn2:hover{border-color:#c9cbd8;background:#fafbff}
-.btn-danger{background:#fff;color:var(--bad);border:1px solid #ffd7d3}
-.btn-danger:hover{background:#fff5f4}
+.btn2{background:var(--card);color:var(--text2);border:1px solid var(--line)}
+.btn2:hover{border-color:var(--muted);background:var(--card2)}
+.btn-danger{background:var(--card);color:var(--bad);border:1px solid color-mix(in srgb,var(--bad) 30%,transparent)}
+.btn-danger:hover{background:var(--bad-soft)}
 .btn-sm{padding:6px 12px;font-size:13px}
-.input{width:100%;border:1px solid var(--line);border-radius:10px;padding:9px 11px;margin:6px 0 10px;font-size:13.5px;background:#fff;color:var(--text);transition:.15s}
-.input:focus{outline:0;border-color:#b9b6f0;box-shadow:0 0 0 3px rgba(91,91,214,.12)}
-.mini{width:130px}
+.btn-xs{padding:3px 9px;font-size:12px;border-radius:8px}
+.input{width:100%;border:1px solid var(--line);border-radius:10px;padding:9px 11px;margin:6px 0 10px;font-size:13.5px;background:var(--card);color:var(--text);transition:.15s;font-family:inherit}
+.input:focus{outline:0;border-color:var(--primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--primary) 18%,transparent)}
+.mini{width:130px;max-width:100%}
 select.input{cursor:pointer}
-label{font-size:13px;color:#4b5563;font-weight:500}
+textarea.input{min-height:84px;resize:vertical}
+label{font-size:13px;color:var(--text2);font-weight:500}
 /* tables */
-table{width:100%;border-collapse:separate;border-spacing:0;background:#fff}
-th{background:#fafbfd;color:var(--muted);font-size:12px;font-weight:600;text-transform:none;letter-spacing:.02em;padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
-td{padding:11px 12px;border-bottom:1px solid #f2f3f8;text-align:left;vertical-align:top}
+.tbl{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid var(--line2);border-radius:12px;margin:6px 0 12px}
+table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card)}
+th{background:var(--card2);color:var(--muted);font-size:12px;font-weight:600;letter-spacing:.02em;padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+td{padding:11px 12px;border-bottom:1px solid var(--line2);text-align:left;vertical-align:top}
 tr:last-child td{border-bottom:0}
-.card table{margin-top:4px}
+tbody tr:hover td,tr:hover td{background:color-mix(in srgb,var(--primary-soft) 35%,transparent)}
+td .input{margin:3px 0;min-width:90px}
 /* tags */
-.pill{display:inline-block;padding:3px 9px;border-radius:999px;background:#eef0ff;color:#4f46e5;font-size:12px;font-weight:500}
-.pill-green{background:#e8f8ef;color:#0d9f5f}
-.pill-gray{background:#f2f3f8;color:#6b7280}
-.price{font-size:30px;font-weight:800;color:#1f2329;letter-spacing:-.5px}
+.pill{display:inline-block;padding:3px 9px;border-radius:999px;background:var(--primary-soft);color:var(--primary);font-size:12px;font-weight:500;white-space:nowrap}
+.pill-green{background:var(--ok-soft);color:var(--ok)}
+.pill-red{background:var(--bad-soft);color:var(--bad)}
+.pill-warn{background:var(--warn-soft);color:var(--warn)}
+.pill-gray{background:var(--soft);color:var(--muted)}
+.price{font-size:30px;font-weight:800;color:var(--text);letter-spacing:-.5px}
 .price small{font-size:15px;font-weight:600;color:var(--muted);margin-right:2px}
-.plan-card{position:relative;display:flex;flex-direction:column}
-.plan-card.featured{border-color:#c7c4f5;box-shadow:0 10px 26px rgba(91,91,214,.13)}
+.plan-card{position:relative;display:flex;flex-direction:column;transition:transform .15s,box-shadow .15s}
+.plan-card:hover{transform:translateY(-2px);box-shadow:var(--shadow-lg)}
+.plan-card .btn{margin-top:auto}
+.plan-card.featured{border-color:color-mix(in srgb,var(--primary) 45%,transparent);box-shadow:0 10px 26px rgba(91,91,214,.13)}
+.plan-card.featured:before{content:"推荐";position:absolute;top:14px;right:14px;background:linear-gradient(135deg,var(--primary),var(--primary2));color:#fff;font-size:11px;border-radius:999px;padding:2px 9px}
 .plan-card ul{list-style:none;padding:0;margin:12px 0 16px}
-.plan-card li{padding:5px 0;color:#4b5563;font-size:13.5px}
+.plan-card li{padding:5px 0;color:var(--text2);font-size:13.5px}
 .plan-card li:before{content:"✓";color:var(--ok);font-weight:700;margin-right:8px}
-.stat-card{display:flex;flex-direction:column;gap:2px}
-.stat-card b{font-size:22px;font-weight:800}
-.section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:26px 0 12px}
+.stat-card{display:flex;flex-direction:column;gap:4px;margin:0;position:relative;overflow:hidden}
+.stat-card .label{color:var(--muted);font-size:12.5px}
+.stat-card b,.stat-card .value{font-size:24px;font-weight:800;line-height:1.2;word-break:break-all}
+.stat-card .sub{color:var(--muted);font-size:12px}
+.stat-card .ico{position:absolute;right:14px;top:14px;width:36px;height:36px;border-radius:10px;background:var(--primary-soft);color:var(--primary);display:flex;align-items:center;justify-content:center;font-size:17px}
+.bar{height:8px;background:var(--soft);border-radius:999px;overflow:hidden;margin:8px 0}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--primary),var(--primary2));border-radius:999px}
+.bar.warn>i{background:linear-gradient(90deg,#f79009,#f04438)}
+.spark{display:flex;align-items:flex-end;gap:6px;height:110px;padding-top:6px}
+.spark div{flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;height:100%;justify-content:flex-end;min-width:0}
+.spark i{display:block;width:100%;max-width:34px;background:linear-gradient(180deg,var(--primary2),var(--primary));border-radius:6px 6px 2px 2px;min-height:2px}
+.spark span{font-size:11px;color:var(--muted);white-space:nowrap}
+.section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:26px 0 12px;flex-wrap:wrap}
 .section-head h2{margin:0}
+/* key cards */
+.key-list{display:flex;flex-direction:column;gap:10px;margin:10px 0 14px;padding:0;list-style:none}
+.key-item{border:1px solid var(--line);border-radius:12px;padding:12px;background:var(--card2)}
+.key-item .key-top{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.key-item .key-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.key-item form{margin:0}
+.copy-row{display:flex;gap:6px;align-items:center}
+.copy-row .input{margin:6px 0 0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+.list-clean{list-style:none;padding:0;margin:8px 0 0}
+.list-clean li{padding:9px 0;border-bottom:1px dashed var(--line);display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.list-clean li:last-child{border-bottom:0}
 /* code */
-pre{background:#0f1222;color:#d7e3ff;border-radius:12px;padding:14px 16px;overflow:auto;font-size:12.5px;line-height:1.7;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-code{background:#f2f3f8;border-radius:6px;padding:1px 6px;font-size:12.5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre{background:#0f1222;color:#d7e3ff;border-radius:12px;padding:14px 16px;overflow:auto;font-size:12.5px;line-height:1.7;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;position:relative;max-width:100%}
+[data-theme=dark] pre{background:#0a0c14;border:1px solid var(--line)}
+code{background:var(--soft);border-radius:6px;padding:1px 6px;font-size:12.5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-word}
 pre code{background:none;padding:0}
+.pre-wrap{position:relative}
+.copy-btn{position:absolute;top:8px;right:8px;background:rgba(255,255,255,.1);color:#d7e3ff;border:1px solid rgba(255,255,255,.18);border-radius:8px;padding:2px 9px;font-size:12px;cursor:pointer;opacity:.75}
+.copy-btn:hover{opacity:1}
 .key-line{word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
 .curl-box{max-height:280px}
+/* tabs */
+.tabs{display:flex;gap:6px;overflow-x:auto;padding:6px;background:var(--card);border:1px solid var(--line);border-radius:14px;margin-bottom:16px;position:sticky;top:70px;z-index:20;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tabs a{flex:none;padding:8px 14px;border-radius:10px;color:var(--text2);font-size:13.5px;white-space:nowrap}
+.tabs a:hover{background:var(--soft);opacity:1}
+.tabs a.active{background:linear-gradient(135deg,var(--primary),var(--primary2));color:#fff;font-weight:600}
+.tab-pane{display:none}.tab-pane.active{display:block}
+.js-off .tab-pane{display:block}
 /* playground */
-.playground{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(360px,.85fr);gap:16px;align-items:start}
+.playground{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(320px,.85fr);gap:16px;align-items:start}
 .chat-toolbar{display:grid;grid-template-columns:minmax(220px,1fr) auto;gap:10px;align-items:end}
-.chat-prompt{min-height:130px;max-height:240px;resize:vertical;margin-top:10px;width:100%;border:1px solid var(--line);border-radius:10px;padding:10px;font-family:inherit}
-.chat-result{min-height:220px;max-height:520px}
-.result-card{background:#fafbff;border:1px solid var(--line);border-radius:12px;padding:14px;margin-top:10px}
+.chat-prompt{min-height:130px;max-height:320px;resize:vertical;margin-top:10px;width:100%;border:1px solid var(--line);border-radius:10px;padding:10px;font-family:inherit;background:var(--card);color:var(--text)}
+.chat-result{min-height:220px;max-height:560px;overflow:auto}
+.result-card{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:14px;margin-top:10px}
 .result-meta{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 12px}
-.result-meta span{background:#eef0ff;color:#4f46e5;border-radius:999px;padding:3px 9px;font-size:12px}
-.assistant-answer{white-space:pre-wrap;line-height:1.75;font-size:14.5px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;color:#1f2329}
+.result-meta span{background:var(--primary-soft);color:var(--primary);border-radius:999px;padding:3px 9px;font-size:12px}
+.assistant-answer{white-space:pre-wrap;line-height:1.75;font-size:14.5px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;color:var(--text);word-break:break-word}
 .raw-json summary{cursor:pointer;color:var(--primary);margin-top:12px}
 .raw-json pre{max-height:360px}
 /* misc */
 .inline-form{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:0}
 .inline-form .input{width:auto;margin:0}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0}
 .model-search{max-width:320px}
 .foot{max-width:1240px;margin:20px auto 40px;padding:18px 20px 0;border-top:1px solid var(--line);color:var(--muted);font-size:12.5px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.copy-box{background:#fafbff;border:1px dashed #d8dae8;border-radius:10px;padding:10px 12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;word-break:break-all}
+.copy-box{background:var(--card2);border:1px dashed var(--line);border-radius:10px;padding:10px 12px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;word-break:break-all}
+.toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(20px);background:#111827;color:#fff;padding:9px 16px;border-radius:999px;font-size:13px;opacity:0;transition:.25s;z-index:100;pointer-events:none}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
 /* auth */
 .auth{max-width:440px;margin:34px auto 10px}
 .auth-head{text-align:center;margin-bottom:16px}
 .auth-head h2{font-size:23px;margin-bottom:6px}
 .auth-head p{color:var(--muted);font-size:13.5px}
-.auth-card{background:#fff;border:1px solid var(--line);border-radius:18px;padding:26px 24px;box-shadow:0 12px 32px rgba(16,24,40,.07)}
+.auth-card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:26px 24px;box-shadow:var(--shadow-lg)}
 .auth-switch{text-align:center;margin-top:14px;color:var(--muted);font-size:13.5px}
 .auth-card .btn{width:100%;padding:11px 16px;font-size:14px}
-@media(max-width:900px){.two,.playground,.chat-toolbar{grid-template-columns:1fr}.hero{padding:28px 22px}.hero h1{font-size:25px}.menu{gap:0}.brand-text small{display:none}}
-</style></head><body>{{nav|safe}}<main class="wrap">{{body|safe}}</main><footer class="foot"><span>{{site_name}} · OpenAI 兼容大模型网关</span><span>Chat Completions / Responses / Anthropic Messages</span></footer></body></html>'''
+@media(max-width:1024px){.grid-4{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:900px){
+ .two,.playground,.chat-toolbar{grid-template-columns:1fr}
+ .hero{padding:28px 22px}.hero h1{font-size:25px}.hero-stats{gap:18px}
+ .brand-text small{display:none}
+ .nav-toggle{display:inline-flex}
+ .topbar-inner{flex-wrap:wrap;height:auto;min-height:58px;padding:10px 16px;gap:10px}
+ .brand{flex:1}
+ .menu{display:none;order:10;flex-basis:100%;flex-direction:column;align-items:stretch;padding:4px 0 8px}
+ .menu.open{display:flex}
+ .menu a{padding:10px 12px}
+ .user-chip b{display:none}
+ .tabs{top:62px}
+}
+@media(max-width:560px){
+ .wrap{padding:14px 12px 4px}.card{padding:16px;border-radius:12px}
+ .grid-4{grid-template-columns:1fr 1fr;gap:10px}.stat-card b,.stat-card .value{font-size:19px}.stat-card .ico{display:none}
+ h1{font-size:24px}h2{font-size:19px}.hero h1{font-size:22px}.hero{border-radius:16px;padding:22px 18px}
+ .btn{padding:9px 13px}.mini{width:100%}
+ .inline-form .input{width:100%}
+ .user-chip .btn-sm{padding:6px 9px}
+}
+</style></head><body class="js-off">{{nav|safe}}<main class="wrap">{{body|safe}}</main><footer class="foot"><span>{{site_name}} · OpenAI 兼容大模型网关 · {{build}}</span><span>Chat Completions / Responses / Anthropic Messages</span></footer>
+<div class="toast" id="toast"></div>
+<script>
+(function(){
+document.body.classList.remove('js-off');
+var toastT;function toast(t){var e=document.getElementById('toast');e.textContent=t;e.classList.add('show');clearTimeout(toastT);toastT=setTimeout(function(){e.classList.remove('show')},1600);}
+window.lpToast=toast;
+function copy(text){if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(text).then(function(){toast('已复制')},function(){fallback(text)})}else fallback(text);}
+function fallback(text){var t=document.createElement('textarea');t.value=text;t.style.position='fixed';t.style.opacity='0';document.body.appendChild(t);t.select();try{document.execCommand('copy');toast('已复制')}catch(e){toast('复制失败，请手动复制')}document.body.removeChild(t);}
+window.lpCopy=copy;
+/* 主题 */
+var tb=document.getElementById('themeBtn');
+function syncTheme(){if(tb)tb.textContent=document.documentElement.getAttribute('data-theme')==='dark'?'☀':'☾';}
+syncTheme();
+if(tb)tb.addEventListener('click',function(){var d=document.documentElement.getAttribute('data-theme')==='dark';if(d)document.documentElement.removeAttribute('data-theme');else document.documentElement.setAttribute('data-theme','dark');try{localStorage.setItem('lp_theme',d?'light':'dark')}catch(e){}syncTheme();});
+/* 手机菜单 */
+var nt=document.getElementById('navToggle'),menu=document.querySelector('.menu');
+if(nt&&menu)nt.addEventListener('click',function(){menu.classList.toggle('open')});
+/* 当前页面高亮 */
+document.querySelectorAll('.menu a').forEach(function(a){var p=a.getAttribute('href');if(p&&p.indexOf('#')<0&&(p===location.pathname||(p!=='/'&&location.pathname.indexOf(p)===0)))a.classList.add('active')});
+/* 表格横向滚动容器 */
+document.querySelectorAll('table').forEach(function(t){if(t.parentElement&&t.parentElement.classList.contains('tbl'))return;var w=document.createElement('div');w.className='tbl';t.parentNode.insertBefore(w,t);w.appendChild(t);});
+/* 代码块复制按钮 */
+document.querySelectorAll('pre').forEach(function(p){if(p.closest('.raw-json'))return;var b=document.createElement('button');b.type='button';b.className='copy-btn';b.textContent='复制';b.addEventListener('click',function(){copy(p.innerText.replace(/^复制\n?/,'').replace(/复制$/,''))});p.appendChild(b);});
+document.addEventListener('click',function(e){var c=e.target.closest('[data-copy]');if(c){e.preventDefault();var v=c.getAttribute('data-copy');if(v.charAt(0)==='#'){var el=document.querySelector(v);v=el?(el.value||el.textContent):''}copy(v);}});
+/* 危险操作二次确认 & 防重复提交 */
+document.addEventListener('submit',function(e){var f=e.target,b=e.submitter||f.querySelector('button');
+ if(b&&b.classList.contains('btn-danger')&&!f.dataset.confirmed){if(!confirm((b.getAttribute('data-confirm')||('确定要「'+b.textContent.trim()+'」吗？此操作不可撤销。')))){e.preventDefault();return;}}
+ if(b&&!b.classList.contains('no-lock')){setTimeout(function(){b.disabled=true;b.dataset.txt=b.textContent;b.textContent='处理中…'},0);setTimeout(function(){b.disabled=false;if(b.dataset.txt)b.textContent=b.dataset.txt},15000);}
+},true);
+/* 标签页 */
+var tabs=document.querySelectorAll('.tabs a[data-tab]');
+if(tabs.length){
+ function show(id){var ok=false;tabs.forEach(function(a){var on=a.getAttribute('data-tab')===id;a.classList.toggle('active',on);if(on)ok=true});if(!ok)return false;document.querySelectorAll('.tab-pane').forEach(function(p){p.classList.toggle('active',p.id==='tab-'+id)});try{sessionStorage.setItem('lp_tab_'+location.pathname,id)}catch(e){}return true;}
+ tabs.forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();var id=a.getAttribute('data-tab');show(id);history.replaceState(null,'','#'+id);window.scrollTo({top:0,behavior:'smooth'})})});
+ var init=(location.hash||'').slice(1);var saved='';try{saved=sessionStorage.getItem('lp_tab_'+location.pathname)||''}catch(e){}
+ if(!(init&&show(init))&&!(saved&&show(saved)))show(tabs[0].getAttribute('data-tab'));
+}
+})();
+</script></body></html>'''
+
+# ---------- CSRF 防护 ----------
+CSRF_PROTECTED_PREFIXES = ('/login', '/register', '/dashboard', '/playground', '/admin', '/ticket/')
+_FORM_POST_RE = re.compile(r'(<form\b[^>]*\bmethod=["\']?post["\']?[^>]*>)', re.I)
+
+def csrf_token():
+    t = session.get('_csrf')
+    if not t:
+        t = secrets.token_urlsafe(24); session['_csrf'] = t
+    return t
+
+def inject_csrf(html_text):
+    tok = csrf_token()
+    return _FORM_POST_RE.sub(lambda m: m.group(1) + f'<input type="hidden" name="_csrf" value="{tok}">', html_text)
+
+@app.before_request
+def csrf_protect():
+    if request.method != 'POST': return None
+    p = request.path or ''
+    if not any(p == x or p.startswith(x if x.endswith('/') else x + '/') or p == x.rstrip('/') for x in CSRF_PROTECTED_PREFIXES):
+        return None
+    sent = request.form.get('_csrf') or request.headers.get('X-CSRF-Token') or ''
+    tok = session.get('_csrf') or ''
+    if not tok or not secrets.compare_digest(str(sent), str(tok)):
+        return page('<div class="card"><h2>页面已过期</h2><p class="muted">安全校验失败（CSRF），请刷新页面后重新提交。</p><a class="btn" href="javascript:history.back()">返回</a></div>'), 400
+    return None
+
+# ---------- 登录失败限流（内存，按 IP） ----------
+_LOGIN_FAILS = {}
+_LOGIN_LOCK = threading.Lock()
+
+def client_ip():
+    xff = (request.headers.get('X-Forwarded-For') or '').split(',')[0].strip()
+    return xff or request.headers.get('X-Real-IP') or request.remote_addr or ''
+
+def login_blocked(ip):
+    now = time.time()
+    with _LOGIN_LOCK:
+        for k in [k for k, v in _LOGIN_FAILS.items() if now - v[1] > 600]: _LOGIN_FAILS.pop(k, None)
+        v = _LOGIN_FAILS.get(ip)
+        return bool(v and v[0] >= LOGIN_MAX_FAILS)
+
+def login_failed(ip):
+    with _LOGIN_LOCK:
+        n, t0 = _LOGIN_FAILS.get(ip, (0, time.time()))
+        _LOGIN_FAILS[ip] = (n + 1, t0)
 
 def h(v):
     return escape('' if v is None else str(v), quote=True)
@@ -299,13 +488,14 @@ def page(body):
         admin_links='<a href="/admin">管理后台</a>' if u['is_admin'] else ''
         menu=(f'<nav class="menu"><a href="/">首页</a><a href="/dashboard">用户控制台</a><a href="/playground">聊天测试</a>'
               f'{admin_links}<a href="/v1/models">模型列表</a><a href="/health">服务状态</a></nav>')
-        chip=(f'<div class="user-chip"><span class="avatar">{h((u["username"] or "U")[:1].upper())}</span>'
-              f'<b>{h(u["username"])}</b><a href="/logout">退出</a></div>')
+        chip=(f'<div class="user-chip"><button class="icon-btn" id="themeBtn" type="button" title="切换深色/浅色">☾</button><span class="avatar">{h((u["username"] or "U")[:1].upper())}</span>'
+              f'<b>{h(u["username"])}</b><a href="/logout">退出</a><button class="icon-btn nav-toggle" id="navToggle" type="button" aria-label="菜单">☰</button></div>')
     else:
         menu='<nav class="menu"><a href="/">首页</a><a href="/#pricing">套餐</a><a href="/#models">模型广场</a><a href="/v1/models">模型列表</a><a href="/health">服务状态</a></nav>'
-        chip='<div class="user-chip"><a class="btn btn2 btn-sm" href="/login">登录</a><a class="btn btn-sm" href="/register">免费注册</a></div>'
+        chip='<div class="user-chip"><button class="icon-btn" id="themeBtn" type="button" title="切换深色/浅色">☾</button><a class="btn btn2 btn-sm" href="/login">登录</a><a class="btn btn-sm" href="/register">注册</a><button class="icon-btn nav-toggle" id="navToggle" type="button" aria-label="菜单">☰</button></div>'
     nav=f'<header class="topbar"><div class="topbar-inner">{brand}{menu}{chip}</div></header>'
-    return render_template_string(HTML, body=body, nav=nav, site_name=h(SITE_NAME))
+    html_out = render_template_string(HTML, body=body, nav=nav, site_name=h(SITE_NAME), build=h(BUILD_TAG))
+    return inject_csrf(html_out) if has_request_context_safe() else html_out
 
 def db():
     if not hasattr(g, 'db'):
@@ -556,14 +746,14 @@ def seed_upstream_from_env(c):
     elif _shorthand:
         groups.append(_shorthand)
     if not groups: return
-    for gi,g in enumerate(groups):
-        base=g['base'].rstrip('/')
+    for gi,grp in enumerate(groups):
+        base=grp['base'].rstrip('/')
         if not base.startswith('http'): continue
-        key=g['key']
-        raw=(g['models'] or '').replace('\n',',')
+        key=grp['key']
+        raw=(grp['models'] or '').replace('\n',',')
         models=[m.strip() for m in raw.split(',') if m.strip()]
         ocr_only=set()
-        if g['fetch'].strip().lower() in ('1','true','yes','on'):
+        if grp['fetch'].strip().lower() in ('1','true','yes','on'):
             fetched=[]; ocr=set()
             for attempt in (1,2,3):
                 try:
@@ -576,9 +766,9 @@ def seed_upstream_from_env(c):
                         outs=[str(x).lower() for x in outs]
                         if 'ocr' in outs and 'text' not in outs: ocr.add(mid)
                     if fetched: break
-                    print('[init] upstream %s: /models returned 0 models (attempt %d/3)' % (g['name'], attempt))
+                    print('[init] upstream %s: /models returned 0 models (attempt %d/3)' % (grp['name'], attempt))
                 except Exception as e:
-                    print('[init] upstream %s: /models attempt %d/3 failed: %s' % (g['name'], attempt, str(e)[:160]))
+                    print('[init] upstream %s: /models attempt %d/3 failed: %s' % (grp['name'], attempt, str(e)[:160]))
                 time.sleep(1.5)
             if fetched:
                 limit=max(1,int(os.environ.get('UPSTREAM_FETCH_MODELS_MAX','500')))
@@ -586,20 +776,20 @@ def seed_upstream_from_env(c):
                 for mid in models:
                     if mid not in kept: kept.append(mid)
                 models=kept; ocr_only=ocr
-                print('[init] upstream %s: fetched %s model ids (%s ocr-only)' % (g['name'], len(fetched), len(ocr)))
+                print('[init] upstream %s: fetched %s model ids (%s ocr-only)' % (grp['name'], len(fetched), len(ocr)))
             else:
-                print('[init] upstream %s: /models fetch failed after 3 attempts, fallback to env list' % g['name'])
+                print('[init] upstream %s: /models fetch failed after 3 attempts, fallback to env list' % grp['name'])
         if not models: models=[MODEL_NAME]
-        is_default=0 if g['default'].strip().lower() in ('0','false','no','off') else 1
+        is_default=0 if grp['default'].strip().lower() in ('0','false','no','off') else 1
         added=0
         for idx, mid in enumerate(models):
             if c.execute('SELECT 1 FROM model_providers WHERE model_id=? AND base_url=?', (mid, base)).fetchone(): continue
             mods='["ocr"]' if mid in ocr_only else '["text"]'
             ep='ocr' if mid in ocr_only else 'chat_completions'
             c.execute('INSERT INTO model_providers(name,provider_type,base_url,api_key,model_id,display_name,is_default,is_active,sort_order,timeout_seconds,endpoint_type,modalities,supports_stream,supports_tools) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                (g['name'],'openai',base,key,mid,mid,is_default if idx==0 else 0,1,(gi+1)*20+idx,'300',ep,mods,0 if mid in ocr_only else 1,0 if mid in ocr_only else 1))
+                (grp['name'],'openai',base,key,mid,mid,is_default if idx==0 else 0,1,(gi+1)*20+idx,'300',ep,mods,0 if mid in ocr_only else 1,0 if mid in ocr_only else 1))
             added+=1
-        print('[init] upstream %s: %s new row(s), %s model(s) total' % (g['name'], added, len(models)))
+        print('[init] upstream %s: %s new row(s), %s model(s) total' % (grp['name'], added, len(models)))
     # 真的导入了上游模型时，把本地 Ollama 占位降级为非默认：
     # 否则首页"默认模型"会显示一个平台上根本不存在的本地模型。
     try:
@@ -612,12 +802,17 @@ def seed_upstream_from_env(c):
 def current_user():
     uid=session.get('uid')
     if not uid: return None
-    return db().execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
+    if hasattr(g,'_cur_user') and g._cur_user is not None and g._cur_user['id']==uid: return g._cur_user
+    u=db().execute('SELECT * FROM users WHERE id=?',(uid,)).fetchone()
+    if not u or not u['is_active']:
+        session.pop('uid',None); return None
+    g._cur_user=u
+    return u
 
 def login_required(fn):
     @wraps(fn)
     def wrapper(*a, **kw):
-        if not current_user(): return redirect('/login')
+        if not current_user(): return redirect('/login?next='+request.path)
         return fn(*a, **kw)
     return wrapper
 
@@ -1519,7 +1714,146 @@ def proxy_ollama_as_response(provider, payload, key, input_tokens, start):
     record_usage(key,input_tokens,out_tokens,model,'/v1/responses',start)
     return jsonify({'id':'resp-local','object':'response','created_at':time.time(),'model':model,'output_text':content,'output':[{'type':'message','role':'assistant','content':[{'type':'output_text','text':content}]}],'usage':{'input_tokens':input_tokens,'output_tokens':out_tokens,'total_tokens':input_tokens+out_tokens}})
 
+# ---------- Anthropic Messages <-> OpenAI Chat 协议转换 ----------
+# /v1/messages 的请求落到 OpenAI 兼容（或 Ollama）上游时，入参和出参都要转换成对应协议，
+# 否则 Claude Code / Anthropic SDK 会因为拿到 chat.completion 格式而解析失败。
+_STOP_MAP = {'stop': 'end_turn', 'length': 'max_tokens', 'tool_calls': 'tool_use', 'function_call': 'tool_use', 'content_filter': 'end_turn'}
+
+def _anthropic_blocks_to_chat(content):
+    if isinstance(content, str): return content
+    parts = []
+    for b in content or []:
+        if isinstance(b, str): parts.append({'type': 'text', 'text': b}); continue
+        if not isinstance(b, dict): continue
+        t = b.get('type')
+        if t == 'text': parts.append({'type': 'text', 'text': b.get('text', '')})
+        elif t == 'image':
+            src = b.get('source') or {}
+            if src.get('type') == 'base64': url = 'data:%s;base64,%s' % (src.get('media_type', 'image/png'), src.get('data', ''))
+            else: url = src.get('url', '')
+            if url: parts.append({'type': 'image_url', 'image_url': {'url': url}})
+        elif t == 'tool_result':
+            c = b.get('content')
+            txt = c if isinstance(c, str) else ''.join(x.get('text', '') for x in (c or []) if isinstance(x, dict))
+            parts.append({'type': 'text', 'text': '[tool_result %s]\n%s' % (b.get('tool_use_id', ''), txt)})
+        elif t == 'tool_use':
+            parts.append({'type': 'text', 'text': '[tool_use %s] %s' % (b.get('name', ''), json.dumps(b.get('input') or {}, ensure_ascii=False))})
+    if parts and all(x['type'] == 'text' for x in parts): return '\n'.join(x['text'] for x in parts)
+    return parts
+
+def anthropic_request_to_chat(payload):
+    msgs = []
+    sysv = payload.get('system')
+    if sysv:
+        sys_text = sysv if isinstance(sysv, str) else '\n'.join(x.get('text', '') for x in sysv if isinstance(x, dict))
+        if sys_text.strip(): msgs.append({'role': 'system', 'content': sys_text})
+    for m in payload.get('messages') or []:
+        if isinstance(m, dict): msgs.append({'role': m.get('role', 'user'), 'content': _anthropic_blocks_to_chat(m.get('content', ''))})
+    out = {'messages': msgs, 'stream': bool(payload.get('stream'))}
+    if payload.get('model'): out['model'] = payload['model']
+    if payload.get('max_tokens'): out['max_tokens'] = payload['max_tokens']
+    for k in ('temperature', 'top_p'):
+        if payload.get(k) is not None: out[k] = payload[k]
+    if payload.get('stop_sequences'): out['stop'] = payload['stop_sequences']
+    return out
+
+def chat_to_anthropic_message(data, model):
+    ch = ((data or {}).get('choices') or [{}])[0] or {}
+    msg = ch.get('message') or {}
+    text = msg.get('content') or ''
+    if isinstance(text, list): text = ''.join(x.get('text', '') for x in text if isinstance(x, dict))
+    usage = (data or {}).get('usage') or {}
+    return {'id': 'msg_' + str((data or {}).get('id') or secrets.token_hex(8)).replace('chatcmpl-', ''), 'type': 'message', 'role': 'assistant', 'model': (data or {}).get('model') or model,
+            'content': [{'type': 'text', 'text': text}], 'stop_reason': _STOP_MAP.get(ch.get('finish_reason') or 'stop', 'end_turn'), 'stop_sequence': None,
+            'usage': {'input_tokens': int(usage.get('prompt_tokens') or 0), 'output_tokens': int(usage.get('completion_tokens') or 0)}}
+
+def _sse(event, obj):
+    return 'event: %s\ndata: %s\n\n' % (event, json.dumps(obj, ensure_ascii=False))
+
+def _iter_chat_sse(resp):
+    """把上游 OpenAI 流式响应（Flask Response）逐个解析成 chunk dict。"""
+    buf = ''
+    for chunk in resp.response:
+        if isinstance(chunk, bytes): chunk = chunk.decode('utf-8', 'ignore')
+        buf += chunk
+        while '\n' in buf:
+            line, buf = buf.split('\n', 1); line = line.strip()
+            if not line.startswith('data:'): continue
+            d = line[5:].strip()
+            if d == '[DONE]': return
+            try: yield json.loads(d)
+            except Exception: continue
+
+def chat_stream_to_anthropic(resp, model):
+    def gen():
+        mid = 'msg_' + secrets.token_hex(12); out_n = 0; stop = 'end_turn'
+        yield _sse('message_start', {'type': 'message_start', 'message': {'id': mid, 'type': 'message', 'role': 'assistant', 'model': model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'output_tokens': 0}}})
+        yield _sse('content_block_start', {'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})
+        for obj in _iter_chat_sse(resp):
+            ch = (obj.get('choices') or [{}])[0] or {}
+            delta = (ch.get('delta') or {}).get('content') or ''
+            if delta:
+                out_n += max(1, len(delta) // 2)
+                yield _sse('content_block_delta', {'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': delta}})
+            if ch.get('finish_reason'): stop = _STOP_MAP.get(ch['finish_reason'], 'end_turn')
+            u = obj.get('usage') or {}
+            if u.get('completion_tokens'): out_n = int(u['completion_tokens'])
+        yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': 0})
+        yield _sse('message_delta', {'type': 'message_delta', 'delta': {'stop_reason': stop, 'stop_sequence': None}, 'usage': {'output_tokens': out_n}})
+        yield _sse('message_stop', {'type': 'message_stop'})
+    return Response(gen(), mimetype='text/event-stream', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+def chat_stream_to_responses(resp, model):
+    def gen():
+        rid = 'resp_' + secrets.token_hex(12); full = ''
+        yield _sse('response.created', {'type': 'response.created', 'response': {'id': rid, 'object': 'response', 'model': model, 'status': 'in_progress'}})
+        for obj in _iter_chat_sse(resp):
+            delta = (((obj.get('choices') or [{}])[0] or {}).get('delta') or {}).get('content') or ''
+            if delta:
+                full += delta
+                yield _sse('response.output_text.delta', {'type': 'response.output_text.delta', 'response_id': rid, 'output_index': 0, 'content_index': 0, 'delta': delta})
+        yield _sse('response.output_text.done', {'type': 'response.output_text.done', 'response_id': rid, 'output_index': 0, 'content_index': 0, 'text': full})
+        yield _sse('response.completed', {'type': 'response.completed', 'response': {'id': rid, 'object': 'response', 'model': model, 'status': 'completed', 'output_text': full,
+               'output': [{'type': 'message', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': full}]}]}})
+    return Response(gen(), mimetype='text/event-stream', headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+def response_text_any(data):
+    """从 chat / responses / anthropic 三种格式里取出文本，用于判断"空回复"。"""
+    if not isinstance(data, dict): return ''
+    if data.get('choices'):
+        m = (data['choices'][0] or {}).get('message') or {}
+        if m.get('tool_calls'): return '[tool_calls]'
+        c = m.get('content') or ''
+        return c if isinstance(c, str) else json.dumps(c)
+    if data.get('type') == 'message' and isinstance(data.get('content'), list):
+        if any(isinstance(b, dict) and b.get('type') == 'tool_use' for b in data['content']): return '[tool_use]'
+        return ''.join(b.get('text', '') for b in data['content'] if isinstance(b, dict))
+    if data.get('object') == 'response' or 'output' in data or 'output_text' in data:
+        return extract_responses_text(data)
+    return ''
+
 def proxy_provider(provider, payload, key, input_tokens, start, target_api='chat_completions'):
+    endpoint_type = get_provider_endpoint_type(provider) if provider['provider_type'] != 'ollama' else 'ollama'
+    if target_api == 'messages' and endpoint_type != 'anthropic_messages':
+        chat_payload = anthropic_request_to_chat(payload)
+        resp = _proxy_provider_raw(provider, chat_payload, key, input_tokens, start, 'chat_completions')
+        if chat_payload.get('stream'): return chat_stream_to_anthropic(resp, provider['model_id'])
+        try: data = json.loads(resp.get_data().decode('utf-8'))
+        except Exception: return resp
+        return jsonify(chat_to_anthropic_message(data, provider['model_id']))
+    if target_api == 'responses' and payload.get('stream') and endpoint_type not in ('responses',):
+        p2 = dict(payload)
+        if 'messages' not in p2: p2['messages'] = responses_input_to_chat_messages(p2.get('input', ''))
+        p2.pop('input', None)
+        if endpoint_type == 'ollama':
+            p2['stream'] = False
+        resp = _proxy_provider_raw(provider, p2, key, input_tokens, start, 'chat_completions')
+        if p2.get('stream'): return chat_stream_to_responses(resp, provider['model_id'])
+        try: return jsonify(chat_completion_to_response(json.loads(resp.get_data().decode('utf-8')), provider['model_id']))
+        except Exception: return resp
+    return _proxy_provider_raw(provider, payload, key, input_tokens, start, target_api)
+
+def _proxy_provider_raw(provider, payload, key, input_tokens, start, target_api='chat_completions'):
     if provider['provider_type']=='ollama':
         if target_api=='responses':
             return proxy_ollama_as_response(provider,payload,key,input_tokens,start)
@@ -1716,13 +2050,21 @@ def register_form_html():
 def login():
     msg=''
     if request.method=='POST':
+        ip=client_ip()
+        if login_blocked(ip):
+            return auth_card('登录','使用 OpenAI 兼容接口，登录后即可创建 API Key',login_form_html(),'<div class="alert alert-bad">登录失败次数过多，请 10 分钟后再试</div>'),429
         name=request.form.get('username','').strip(); pw=request.form.get('password','')
         u=db().execute('SELECT * FROM users WHERE username=? OR email=?',(name,name)).fetchone()
         if u and check_password_hash(u['password_hash'],pw):
             if not u['is_active']:
-                return auth_card('登录','使用 OpenAI 兼容接口，登录后即可创建 API Key','<p class="bad">账号未激活，请先前往邮箱点击激活链接</p>'+login_form_html())
-            session['uid']=u['id']; db().execute('UPDATE users SET last_login=CURRENT_TIMESTAMP WHERE id=?',(u['id'],)); db().commit(); return redirect('/dashboard')
-        msg='<p class="bad">账号或密码错误</p>'
+                return auth_card('登录','使用 OpenAI 兼容接口，登录后即可创建 API Key',login_form_html(),'<div class="alert alert-warn">账号未激活或已被禁用，请前往邮箱点击激活链接或联系管理员</div>')
+            nxt=request.args.get('next') or ''
+            session.clear(); session.permanent=True; session['uid']=u['id']
+            try: db().execute('UPDATE users SET last_login=CURRENT_TIMESTAMP WHERE id=?',(u['id'],)); db().commit()
+            except sqlite3.Error: pass
+            return redirect(nxt if (nxt.startswith('/') and not nxt.startswith('//')) else ('/admin' if u['is_admin'] else '/dashboard'))
+        login_failed(ip)
+        msg='<div class="alert alert-bad">账号或密码错误</div>'
     return auth_card('登录','使用 OpenAI 兼容接口，登录后即可创建 API Key',login_form_html(),msg)
 
 @app.route('/register',methods=['GET','POST'])
@@ -1800,13 +2142,9 @@ def format_playground_result(provider, response_text, elapsed_ms=None):
 @app.route('/playground',methods=['GET','POST'])
 @login_required
 def playground():
-    u=current_user(); con=db(); result=''; raw=''
+    u=current_user(); result=''
     if request.method=='POST':
         prompt=request.form.get('prompt','你好')
-        k=con.execute('SELECT * FROM api_keys WHERE user_id=? AND is_active=1 ORDER BY id DESC LIMIT 1',(u['id'],)).fetchone()
-        if not k:
-            raw='sk-'+secrets.token_urlsafe(32); con.execute('INSERT INTO api_keys(user_id,key_hash,key_prefix,name,rate_limit) VALUES(?,?,?,?,?)',(u['id'],hashlib.sha256(raw.encode()).hexdigest(),raw[:10],'playground',get_plan_config(True).get(u['plan'],PLAN_CONFIG['free'])['rate_limit'])); con.commit()
-        else: raw=k['key_prefix']+'...（已有 Key，完整值只在创建时显示）'
         try:
             errors=[]
             for provider in filter_candidates_by_capability(candidate_model_rows(request.form.get('model')), {'messages':[{'role':'user','content':prompt}]}, None):
@@ -1817,27 +2155,33 @@ def playground():
                     if provider['provider_type']=='ollama':
                         model_id=(provider['model_id'] if provider else MODEL_NAME)
                         if not model_id.endswith(':latest') and ':' not in model_id: model_id=model_id+':latest'
-                        rr=requests.post((provider['base_url'] if provider else OLLAMA_BASE_URL).rstrip()+'/api/generate',json={'model':model_id,'prompt':prompt,'stream':False},timeout=min(60,int(provider['timeout_seconds'] if provider else 300)))
+                        rr=requests.post((provider['base_url'] if provider else OLLAMA_BASE_URL).rstrip('/')+'/api/generate',json={'model':model_id,'prompt':prompt,'stream':False},timeout=min(60,int(provider['timeout_seconds'] if provider else 300)))
                     elif endpoint=='responses':
-                        rr=requests.post((provider['base_url'] or '').rstrip()+'/responses',headers=headers,json={'model':provider['model_id'],'input':prompt,'temperature':0.4,'max_output_tokens':256},timeout=min(60,int(provider['timeout_seconds'] or 300)))
+                        rr=requests.post((provider['base_url'] or '').rstrip('/')+'/responses',headers=headers,json={'model':provider['model_id'],'input':prompt,'temperature':0.4,'max_output_tokens':256},timeout=min(60,int(provider['timeout_seconds'] or 300)))
                     elif endpoint=='anthropic_messages':
                         extra=get_provider_extra(provider); headers={'Content-Type':'application/json','anthropic-version':extra.get('anthropic_version','2023-06-01')}
                         if provider['api_key']: headers['x-api-key']=provider['api_key']
-                        rr=requests.post((provider['base_url'] or '').rstrip()+'/messages',headers=headers,json={'model':provider['model_id'],'messages':[{'role':'user','content':prompt}],'max_tokens':256},timeout=min(60,int(provider['timeout_seconds'] or 300)))
+                        rr=requests.post((provider['base_url'] or '').rstrip('/')+'/messages',headers=headers,json={'model':provider['model_id'],'messages':[{'role':'user','content':prompt}],'max_tokens':256},timeout=min(60,int(provider['timeout_seconds'] or 300)))
                     else:
-                        rr=requests.post((provider['base_url'] or '').rstrip()+'/chat/completions',headers=headers,json={'model':provider['model_id'],'messages':[{'role':'user','content':prompt}],'temperature':0.4,'max_tokens':256},timeout=min(60,int(provider['timeout_seconds'] or 300)))
+                        rr=requests.post((provider['base_url'] or '').rstrip('/')+'/chat/completions',headers=headers,json={'model':provider['model_id'],'messages':[{'role':'user','content':prompt}],'temperature':0.4,'max_tokens':256},timeout=min(60,int(provider['timeout_seconds'] or 300)))
                     if not rr.ok: raise RuntimeError(f'HTTP {rr.status_code}: {rr.text[:300]}')
                     result=format_playground_result(provider, rr.text, int((time.time()-start_call)*1000)); break
                 except Exception as e:
                     errors.append('%s/%s：%s' % (provider['name'],provider['model_id'],str(e)[:200]))
             if not result: result='<div class="result-card"><div class="assistant-answer">'+h('所有候选模型均调用失败：\n'+'\n'.join(errors))+'</div></div>'
         except Exception as e: result='<div class="result-card"><div class="assistant-answer">'+h('调用失败：'+str(e))+'</div></div>'
-    models='<option value="auto">自动模式 auto · 第三方优先，本地最后兜底</option>'+''.join([f'<option value="{h(m["model_id"])}">{h(m["display_name"] or m["model_id"])} · {h(m["name"])} · {h(m["provider_type"])}</option>' for m in candidate_model_rows('auto')])
+    sel_model=request.form.get('model','auto') if request.method=='POST' else 'auto'
+    prompt_val=request.form.get('prompt','') if request.method=='POST' else ''
+    _cands=candidate_model_rows('auto')
+    models=f'<option value="auto" {sel(sel_model,"auto")}>自动模式 auto · 按实测速度智能选路</option>'+''.join([f'<option value="{h(m["model_id"])}" {sel(sel_model,m["model_id"])}>{h(m["display_name"] or m["model_id"])} · {h(m["name"])}</option>' for m in _cands])
     curl="curl -X POST "+public_base_url()+"/v1/chat/completions \\\n  -H 'Content-Type: application/json' \\\n  -H 'Authorization: Bearer YOUR_API_KEY' \\\n  -d '{\"model\":\"auto\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}'"
-    return page(f'''<div class="two playground">
-<div class="card"><h2>聊天测试</h2><p class="muted">当前登录用户：{h(u["username"])} · ID {u["id"]}</p><form method="post"><div class="chat-toolbar"><div><label class="muted">选择模型</label><select class="input" name="model">{models}</select></div><button class="btn">发送测试</button></div><textarea class="input chat-prompt" name="prompt" rows="5" placeholder="输入问题，支持多行；拖动右下角可调整高度"></textarea></form><h3>输出结果</h3><div class="chat-result">{result or '<div class="result-card"><div class="assistant-answer muted">等待发送测试...</div></div>'}</div></div>
-<div class="card"><h3>使用说明</h3><p><b>推荐使用自动模式：</b><code>model: "auto"</code></p><ul><li>优先调用第三方 / OpenAI 兼容模型。</li><li>第三方模型故障、超时或返回错误时，自动尝试下一条启用模型。</li><li>请求包含图片/视频/音频/tools 时，会先按后台能力配置筛选模型。</li><li>所有第三方都不可用时，最后才切到本地 Ollama。</li><li><code>stream=true</code> 暂不做自动切换，避免流式响应中途换模型。</li></ul><h3>OpenAI 兼容接口</h3><ul><li><code>/v1/models</code></li><li><code>/v1/chat/completions</code></li><li><code>/v1/responses</code></li><li><code>/v1/messages</code></li></ul><h3>curl 测试命令</h3><pre class="curl-box">{h(curl)}</pre><p class="muted key-line">当前 API Key：{h(raw or '请先在控制台创建；发送一次测试会自动生成或复用 Key')}</p></div>
-</div>''')
+    return page(f'''<div class="section-head" style="margin-top:0"><div><h2>聊天测试</h2><p class="muted" style="margin:4px 0 0">在线验证上游连通性 · 当前用户 {h(u["username"])} · 可选 {len(_cands)} 个模型</p></div><a class="btn btn2 btn-sm" href="/dashboard">获取 API Key →</a></div>
+<div class="playground">
+<div class="card"><form method="post" id="pgForm"><div class="chat-toolbar"><div><label>选择模型</label><select class="input" name="model">{models}</select></div><button class="btn" style="margin-bottom:10px">发送测试 ⏎</button></div><textarea class="input chat-prompt" name="prompt" id="pgPrompt" rows="5" placeholder="输入问题，支持多行；Ctrl/⌘ + Enter 快速发送" required>{h(prompt_val)}</textarea></form>
+<div class="card-head" style="margin-top:8px"><h3>输出结果</h3></div><div class="chat-result">{result or '<div class="result-card"><div class="assistant-answer muted">等待发送测试…</div></div>'}</div></div>
+<div class="card"><h3>使用说明</h3><p><b>推荐使用自动模式：</b><code>model: "auto"</code></p><ul><li>按实测速度优先挑选最快的可用模型。</li><li>上游故障、超时或返回错误时，自动尝试下一个候选。</li><li>请求包含图片/视频/音频/tools 时，会先按能力配置筛选模型。</li><li>流式请求在首个字节返回前同样支持换候选重试（<code>STREAM_TRY_LIMIT</code>）。</li></ul><h3>OpenAI 兼容接口</h3><div class="btn-row"><code>/v1/models</code><code>/v1/chat/completions</code><code>/v1/responses</code><code>/v1/messages</code></div><h3>curl 测试命令</h3><pre class="curl-box">{h(curl)}</pre><p class="muted">把 <code>YOUR_API_KEY</code> 换成你在 <a href="/dashboard">用户控制台</a> 创建的 Key。本页测试直接走后台路由，不消耗 Key 额度。</p></div>
+</div>
+<script>document.getElementById("pgPrompt").addEventListener("keydown",function(e){{if(e.key==="Enter"&&(e.ctrlKey||e.metaKey)){{e.preventDefault();document.getElementById("pgForm").requestSubmit();}}}});</script>''')
 
 def usage_guide_html(sample_key):
     """OpenAI 兼容接入说明，登录用户可见。"""
@@ -1893,7 +2237,7 @@ def model_list_html():
 @app.route('/dashboard',methods=['GET','POST'])
 @login_required
 def dashboard():
-    u=current_user(); con=db()
+    u=current_user(); con=db(); act=None
     if request.method=='POST':
         act=request.form.get('act')
         if act=='newkey':
@@ -1906,33 +2250,89 @@ def dashboard():
             kid=request.form.get('key_id'); row=con.execute('SELECT * FROM api_keys WHERE id=? AND user_id=?',(kid,u['id'])).fetchone()
             if row:
                 raw='sk-'+secrets.token_urlsafe(32); con.execute('UPDATE api_keys SET key_hash=?,key_prefix=?,key_plain=?,last_used_at=NULL WHERE id=? AND user_id=?',(hashlib.sha256(raw.encode()).hexdigest(),raw[:10],raw,kid,u['id'])); con.commit(); session['new_key']=raw
+        elif act=='delete_key':
+            kid=request.form.get('key_id')
+            if con.execute('SELECT 1 FROM api_keys WHERE id=? AND user_id=?',(kid,u['id'])).fetchone():
+                con.execute('UPDATE usage_logs SET api_key_id=NULL WHERE api_key_id=?',(kid,)); con.execute('DELETE FROM api_keys WHERE id=? AND user_id=?',(kid,u['id'])); con.commit(); session['flash']='API Key 已删除'
+            return redirect('/dashboard#keys')
+        elif act=='toggle_key':
+            kid=request.form.get('key_id')
+            con.execute('UPDATE api_keys SET is_active=CASE WHEN is_active=1 THEN 0 ELSE 1 END WHERE id=? AND user_id=?',(kid,u['id'])); con.commit(); session['flash']='API Key 状态已更新'
+            return redirect('/dashboard#keys')
         elif act=='ticket':
-            title=request.form.get('title','').strip(); content=request.form.get('content','').strip()
-            cur=con.execute('INSERT INTO tickets(user_id,title,content) VALUES(?,?,?)',(u['id'],title,content)); con.execute('INSERT INTO ticket_messages(ticket_id,user_id,author_role,message) VALUES(?,?,?,?)',(cur.lastrowid,u['id'],'user',content)); con.commit()
+            title=request.form.get('title','').strip()[:120]; content=request.form.get('content','').strip()[:5000]
+            if not title or not content:
+                session['flash']='!请填写工单标题和问题描述'; return redirect('/dashboard#tickets')
+            cur=con.execute('INSERT INTO tickets(user_id,title,content) VALUES(?,?,?)',(u['id'],title,content)); con.execute('INSERT INTO ticket_messages(ticket_id,user_id,author_role,message) VALUES(?,?,?,?)',(cur.lastrowid,u['id'],'user',content)); con.commit(); session['flash']='工单已提交，我们会尽快处理'
+            return redirect('/dashboard#tickets')
         elif act=='order':
             plan=request.form.get('plan','starter'); pay_type=request.form.get('payment_method','alipay')
             if pay_type not in ('alipay','wxpay'): pay_type='alipay'
-            cfg=get_plan_config().get(plan) or PLAN_CONFIG['starter']; order_no='O'+dt.datetime.now().strftime('%Y%m%d%H%M%S')+secrets.token_hex(3).upper(); con.execute('INSERT INTO orders(order_no,user_id,plan_id,amount,payment_method) VALUES(?,?,?,?,?)',(order_no,u['id'],plan,cfg['price'],pay_type)); con.commit(); return redirect('/pay/'+order_no)
-    newkey=session.pop('new_key',None)
+            cfg=get_plan_config().get(plan)
+            if not cfg or float(cfg.get('price') or 0)<=0:
+                session['flash']='!请选择有效的付费套餐'; return redirect('/dashboard#billing')
+            order_no='O'+dt.datetime.now().strftime('%Y%m%d%H%M%S')+secrets.token_hex(3).upper(); con.execute('INSERT INTO orders(order_no,user_id,plan_id,amount,payment_method) VALUES(?,?,?,?,?)',(order_no,u['id'],plan,cfg['price'],pay_type)); con.commit(); return redirect('/pay/'+order_no)
+    if request.method=='POST' and act in ('newkey','rotate_key'):
+        return redirect('/dashboard#keys')
+    newkey=session.pop('new_key',None); flash=session.pop('flash',None)
     keys=con.execute('SELECT * FROM api_keys WHERE user_id=? ORDER BY id DESC',(u['id'],)).fetchall(); orders=con.execute('SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10',(u['id'],)).fetchall(); tickets=con.execute('SELECT * FROM tickets WHERE user_id=? ORDER BY id DESC LIMIT 10',(u['id'],)).fetchall()
     plan_map=get_plan_config(True)
     current_plan=(plan_map.get(u['plan']) or PLAN_CONFIG.get(u['plan']) or PLAN_CONFIG['free'])
     current_plan_name=current_plan.get('name',u['plan'])
     daily_limit=int(u['daily_token_limit'] or current_plan.get('daily_tokens') or 0)
     rate_limit=int(u['custom_rate_limit'] or current_plan.get('rate_limit') or 0)
-    used_today=int(u['tokens_used_today'] or 0)
+    used_today=int(u['tokens_used_today'] or 0) if (u['tokens_reset_date'] or '')==dt.date.today().isoformat() else 0
+    unlimited=bool(u['is_admin'] and ADMIN_UNLIMITED)
     remaining=max(0,daily_limit-used_today) if daily_limit else 0
-    expire_text=h(u['plan_expires_at'] or '长期/未设置')
+    expire_text=h((u['plan_expires_at'] or '长期有效')[:10])
     usage_pct=min(100, int(used_today*100/daily_limit)) if daily_limit else 0
-    plan_usage=f'<div class="card"><h3>当前套餐</h3><p>套餐：<b>{h(current_plan_name)}</b></p><p>每日额度：<b>{daily_limit:,}</b> tokens</p><p>今日已用：<b>{used_today:,}</b> tokens · 剩余：<b>{remaining:,}</b> tokens</p><div style="height:10px;background:#e5e7eb;border-radius:999px;overflow:hidden"><div style="width:{usage_pct}%;height:10px;background:#2563eb"></div></div><p>限速：<b>{rate_limit}</b> 次/分钟</p><p>到期时间：{expire_text}</p></div>'
     max_keys=int(u['max_api_keys'] or 5); key_count=len(keys)
-    key_html=''.join([f'<li><b>{h(k["name"])}</b> · active={k["is_active"]}<br><input class="input" readonly onclick="this.select()" value="{h(k["key_plain"] or (k["key_prefix"]+"...（历史 Key 仅保存前缀，请重新生成后复制）"))}"><form method="post"><input type="hidden" name="act" value="rotate_key"><input type="hidden" name="key_id" value="{k["id"]}"><button class="btn btn2">重新生成并显示</button></form></li>' for k in keys]) or '<li>暂无</li>'
-    order_html=''.join([f'<li>{h(o["order_no"])} · {h((plan_map.get(o["plan_id"]) or {}).get("name", o["plan_id"]))} · ¥{o["amount"]} · {h(o["status"])}</li>' for o in orders]) or '<li>暂无</li>'
-    ticket_html=''.join([f'<li><a href="/ticket/{t["id"]}"><b>#{t["id"]} {h(t["title"])}</b></a> · {h(t["status"])}<br><span class="muted">{h(t["content"])}</span></li>' for t in tickets]) or '<li>暂无</li>'
-    plans=''.join([f'<option value="{h(pid)}">{h(v["name"])} ¥{v["price"]:g}</option>' for pid,v in get_plan_config().items() if pid!='free'])
-    reveal=f'<div class="card"><h3>新 API Key，只显示一次</h3><pre>{h(newkey)}</pre></div>' if newkey else ''
-    sample_key=newkey or next((dict(k).get('key_plain') for k in keys if dict(k).get('key_plain')), 'sk-你的API Key')
-    body=f'<div class="two"><div><div class="card"><h2>用户控制台</h2><p>用户：{h(u["username"])} </p><a href="/logout">退出</a></div>{plan_usage}{reveal}<div class="card"><h3>API Keys</h3><p class="muted">已创建 {key_count} / 允许 {max_keys} 个；点击输入框可全选复制。</p><ul>{key_html}</ul><form method="post"><input type="hidden" name="act" value="newkey"><input class="input" name="name" placeholder="Key 名称"><button class="btn">创建 API Key</button></form></div></div><div><div class="card"><h3>购买套餐</h3><form method="post"><input type="hidden" name="act" value="order"><select class="input" name="plan">{plans}</select><select class="input" name="payment_method"><option value="alipay">支付宝</option><option value="wxpay">微信支付</option></select><button class="btn">创建订单</button></form><h4>我的订单</h4><ul>{order_html}</ul></div><div class="card"><h3>提交工单</h3><form method="post"><input type="hidden" name="act" value="ticket"><input class="input" name="title" placeholder="标题"><textarea class="input" name="content" placeholder="问题描述"></textarea><button class="btn btn2">提交</button></form><h4>我的工单</h4><ul>{ticket_html}</ul></div></div></div>{usage_guide_html(sample_key)}{model_list_html()}'
+    # 近 7 天用量
+    since=(dt.date.today()-dt.timedelta(days=6)).isoformat()
+    day_rows={r['d']:r for r in con.execute("SELECT substr(created_at,1,10) d,count(*) calls,COALESCE(sum(tokens_input+tokens_output),0) tok FROM usage_logs WHERE user_id=? AND created_at>=? GROUP BY d",(u['id'],since)).fetchall()}
+    days=[(dt.date.today()-dt.timedelta(days=i)).isoformat() for i in range(6,-1,-1)]
+    vals=[int(day_rows[d]['tok']) if d in day_rows else 0 for d in days]; calls7=sum(int(day_rows[d]['calls']) for d in days if d in day_rows)
+    vmax=max(vals) or 1
+    spark=''.join(f'<div title="{d}：{v:,} tokens"><i style="height:{max(2,int(v*100/vmax))}%"></i><span>{d[5:]}</span></div>' for d,v in zip(days,vals))
+    recent=con.execute('SELECT l.*,k.name kname FROM usage_logs l LEFT JOIN api_keys k ON k.id=l.api_key_id WHERE l.user_id=? ORDER BY l.id DESC LIMIT 10',(u['id'],)).fetchall()
+    recent_html=''.join(f'<tr><td class="muted">{h((r["created_at"] or "")[5:16])}</td><td><b>{h(r["model"])}</b></td><td>{h(r["kname"] or "-")}</td><td>{int(r["tokens_input"] or 0):,} / {int(r["tokens_output"] or 0):,}</td><td>{int(r["duration_ms"] or 0):,} ms</td></tr>' for r in recent) or '<tr><td colspan="5" class="muted">还没有调用记录，创建 Key 后调用 /v1/chat/completions 试试</td></tr>'
+    flash_html=''
+    if flash:
+        bad=flash.startswith('!'); flash_html=f'<div class="alert {"alert-bad" if bad else "alert-ok"}">{h(flash.lstrip("!"))}</div>'
+    stats=f"""<div class="grid-4">
+<div class="card stat-card"><span class="ico">◆</span><span class="label">当前套餐</span><span class="value">{h(current_plan_name)}</span><span class="sub">到期：{expire_text}</span></div>
+<div class="card stat-card"><span class="ico">⚡</span><span class="label">今日已用 tokens</span><span class="value">{used_today:,}</span><div class="bar{' warn' if usage_pct>=85 else ''}"><i style="width:{0 if unlimited else usage_pct}%"></i></div><span class="sub">{'管理员不限额' if unlimited else ('剩余 %s / 共 %s' % (format(remaining,','), format(daily_limit,',')) if daily_limit else '未设置额度')}</span></div>
+<div class="card stat-card"><span class="ico">⏱</span><span class="label">限速</span><span class="value">{rate_limit} <small class="muted" style="font-size:13px">次/分</small></span><span class="sub">近 7 天调用 {calls7:,} 次</span></div>
+<div class="card stat-card"><span class="ico">🔑</span><span class="label">API Keys</span><span class="value">{key_count} <small class="muted" style="font-size:13px">/ {max_keys}</small></span><span class="sub">{sum(1 for k in keys if k['is_active'])} 个启用中</span></div>
+</div>"""
+    def key_card(k):
+        val=k["key_plain"] or ''
+        shown=val if val else (k["key_prefix"]+'…（旧版 Key 仅保存前缀，点「重新生成」获取完整值）')
+        st='<span class="pill pill-green">启用</span>' if k['is_active'] else '<span class="pill pill-gray">已停用</span>'
+        return (f'<li class="key-item"><div class="key-top"><div><b>{h(k["name"] or "未命名")}</b> {st}</div><span class="muted" style="font-size:12px">创建 {h((k["created_at"] or "")[:10])} · 最近使用 {h((k["last_used_at"] or "从未")[:16])}</span></div>'
+                f'<div class="copy-row"><input class="input" id="key{k["id"]}" readonly onclick="this.select()" value="{h(shown)}">'+(f'<button type="button" class="btn btn2 btn-sm" data-copy="#key{k["id"]}">复制</button>' if val else '')+'</div>'
+                f'<div class="key-actions"><form method="post"><input type="hidden" name="act" value="toggle_key"><input type="hidden" name="key_id" value="{k["id"]}"><button class="btn btn2 btn-xs">{"停用" if k["is_active"] else "启用"}</button></form>'
+                f'<form method="post"><input type="hidden" name="act" value="rotate_key"><input type="hidden" name="key_id" value="{k["id"]}"><button class="btn btn2 btn-xs">重新生成</button></form>'
+                f'<form method="post"><input type="hidden" name="act" value="delete_key"><input type="hidden" name="key_id" value="{k["id"]}"><button class="btn btn-danger btn-xs" data-confirm="删除后使用该 Key 的应用将立即失效，确定删除？">删除</button></form></div></li>')
+    key_html=''.join(key_card(k) for k in keys) or '<li class="muted">还没有 API Key，在下方创建一个吧</li>'
+    status_pill=lambda st: {'paid':'pill-green','pending':'pill-warn','closed':'pill-gray','open':'pill-warn'}.get(st,'pill-gray')
+    order_html=''.join([f'<li><span><b>{h((plan_map.get(o["plan_id"]) or {}).get("name", o["plan_id"]))}</b> · ¥{o["amount"]:g}<br><span class="muted key-line">{h(o["order_no"])}</span></span><span>'+(f'<a class="btn btn2 btn-xs" href="/pay/{h(o["order_no"])}">去支付</a> ' if o["status"]=="pending" else '')+f'<span class="pill {status_pill(o["status"])}">{h(o["status"])}</span></span></li>' for o in orders]) or '<li class="muted">暂无订单</li>'
+    ticket_html=''.join([f'<li><span><a href="/ticket/{t["id"]}"><b>#{t["id"]} {h(t["title"])}</b></a><br><span class="muted">{h((t["content"] or "")[:60])}</span></span><span class="pill {status_pill(t["status"])}">{h(t["status"])}</span></li>' for t in tickets]) or '<li class="muted">暂无工单</li>'
+    plans=''.join([f'<option value="{h(pid)}">{h(v["name"])} · ¥{v["price"]:g} · 每日 {v["daily_tokens"]:,} tokens</option>' for pid,v in get_plan_config().items() if float(v['price'] or 0)>0])
+    reveal=f'<div class="alert alert-warn"><b>新的 API Key（请立即复制保存）</b><div class="copy-row"><input class="input" id="newKey" readonly value="{h(newkey)}" onclick="this.select()"><button type="button" class="btn btn-sm" data-copy="#newKey">复制</button></div></div>' if (newkey and newkey.startswith('sk-')) else (f'<div class="alert alert-bad">{h(newkey)}</div>' if newkey else '')
+    sample_key=(newkey if (newkey and newkey.startswith('sk-')) else None) or next((dict(k).get('key_plain') for k in keys if dict(k).get('key_plain')), 'sk-你的API Key')
+    buy_card=(f'<form method="post"><input type="hidden" name="act" value="order"><label>选择套餐</label><select class="input" name="plan">{plans}</select><label>支付方式</label><select class="input" name="payment_method"><option value="alipay">支付宝</option><option value="wxpay">微信支付</option></select><button class="btn">创建订单并支付</button></form>' if plans else '<p class="muted">暂无可购买的付费套餐。</p>')
+    body=f"""<div class="section-head" style="margin-top:0"><div><h2>你好，{h(u["username"])} 👋</h2><p class="muted" style="margin:4px 0 0">Base URL：<code>{h(public_base_url())}/v1</code> <a href="#" data-copy="{h(public_base_url())}/v1">复制</a></p></div><div class="btn-row"><a class="btn btn2 btn-sm" href="/playground">在线测试</a>{'<a class="btn btn-sm" href="/admin">管理后台</a>' if u['is_admin'] else ''}</div></div>
+{flash_html}{reveal}{stats}
+<div class="two"><div>
+<div class="card" id="keys"><div class="card-head"><h3>API Keys</h3><span class="muted">{key_count} / {max_keys}</span></div><ul class="key-list">{key_html}</ul>
+<form method="post" class="inline-form"><input type="hidden" name="act" value="newkey"><input class="input" name="name" placeholder="Key 名称，如：my-app" maxlength="40" style="flex:1;min-width:160px"><button class="btn"{' disabled' if key_count>=max_keys else ''}>＋ 创建 Key</button></form></div>
+<div class="card"><div class="card-head"><h3>近 7 天用量</h3><span class="muted">{sum(vals):,} tokens</span></div><div class="spark">{spark}</div></div>
+<div class="card"><h3>最近调用</h3><table><tr><th>时间</th><th>模型</th><th>Key</th><th>输入/输出</th><th>耗时</th></tr>{recent_html}</table></div>
+</div><div>
+<div class="card" id="billing"><h3>购买 / 续费套餐</h3>{buy_card}<h4>我的订单</h4><ul class="list-clean">{order_html}</ul></div>
+<div class="card" id="tickets"><h3>提交工单</h3><form method="post"><input type="hidden" name="act" value="ticket"><input class="input" name="title" placeholder="标题" maxlength="120" required><textarea class="input" name="content" placeholder="请描述你遇到的问题，附上报错信息更快定位" required></textarea><button class="btn btn2">提交工单</button></form><h4>我的工单</h4><ul class="list-clean">{ticket_html}</ul></div>
+</div></div>{usage_guide_html(sample_key)}{model_list_html()}"""
     return page(body)
 
 @app.route('/ticket/<int:ticket_id>',methods=['GET','POST'])
@@ -1942,10 +2342,15 @@ def ticket_detail(ticket_id):
     if not t: return page('<div class="card">工单不存在</div>'),404
     if request.method=='POST':
         msg=request.form.get('message','').strip()
-        if msg: con.execute('INSERT INTO ticket_messages(ticket_id,user_id,author_role,message) VALUES(?,?,?,?)',(ticket_id,u['id'],'user',msg)); con.execute('UPDATE tickets SET status="open",updated_at=CURRENT_TIMESTAMP WHERE id=?',(ticket_id,)); con.commit(); return redirect('/ticket/'+str(ticket_id))
+        if msg: con.execute('INSERT INTO ticket_messages(ticket_id,user_id,author_role,message) VALUES(?,?,?,?)',(ticket_id,u['id'],'user',msg)); con.execute('UPDATE tickets SET status=\'open\',updated_at=CURRENT_TIMESTAMP WHERE id=?',(ticket_id,)); con.commit(); return redirect('/ticket/'+str(ticket_id))
     msgs=con.execute('SELECT m.*,u.username FROM ticket_messages m LEFT JOIN users u ON u.id=m.user_id WHERE m.ticket_id=? ORDER BY m.id ASC',(ticket_id,)).fetchall()
-    mh=''.join([f'<div class="card"><span class="pill">{h(m["author_role"])}</span><p>{h(m["message"])}</p><p class="muted">{h(m["username"] or "管理员")} · {h(m["created_at"])}</p></div>' for m in msgs])
-    return page(f'<div class="card"><h2>工单 #{t["id"]} {h(t["title"])}</h2><p>状态：<b>{h(t["status"])}</b></p></div>{mh}<div class="card"><h3>继续补充</h3><form method="post"><textarea class="input" name="message" rows="4"></textarea><button class="btn">提交</button> <a class="btn btn2" href="/dashboard">返回</a></form></div>')
+    def _bubble(m):
+        mine=(m['author_role']!='admin')
+        return (f'<div style="display:flex;justify-content:{"flex-end" if mine else "flex-start"};margin:10px 0"><div style="max-width:min(640px,88%);background:{"var(--primary-soft)" if mine else "var(--card2)"};border:1px solid var(--line);border-radius:14px;padding:10px 14px">'
+                f'<div class="muted" style="font-size:12px;margin-bottom:4px">{"我" if mine else "客服 / 管理员"} · {h((m["created_at"] or "")[:16])}</div><div style="white-space:pre-wrap;word-break:break-word">{h(m["message"])}</div></div></div>')
+    mh=''.join(_bubble(m) for m in msgs) or '<p class="muted">暂无消息</p>'
+    pill={'open':'pill-warn','pending':'pill-warn','closed':'pill-gray'}.get(t['status'],'pill-gray')
+    return page(f'<div class="section-head" style="margin-top:0"><div><h2>工单 #{t["id"]} · {h(t["title"])}</h2><p class="muted" style="margin:4px 0 0">创建于 {h((t["created_at"] or "")[:16])} · <span class="pill {pill}">{h(t["status"])}</span></p></div><a class="btn btn2 btn-sm" href="/dashboard#tickets">← 返回控制台</a></div><div class="card">{mh}</div><div class="card"><h3>继续补充</h3><form method="post"><textarea class="input" name="message" rows="4" placeholder="补充说明或回复客服" required></textarea><button class="btn">提交</button></form></div>')
 
 @app.route('/pay/<order_no>')
 @login_required
@@ -1967,11 +2372,18 @@ def pay(order_no):
 @app.route('/payment/notify',methods=['GET','POST'])
 def payment_notify():
     params=request.args.to_dict() or request.form.to_dict()
-    if not (get_settings().get('epay_key') or '') or params.get('sign')!=epay_sign(params): return 'fail',400
+    if not (get_settings().get('epay_key') or '') or not secrets.compare_digest(str(params.get('sign') or ''), epay_sign(params)): return 'fail',400
     if params.get('trade_status')=='TRADE_SUCCESS':
         con=db(); o=con.execute('SELECT * FROM orders WHERE order_no=?',(params.get('out_trade_no'),)).fetchone()
+        if o and o['status']=='paid':
+            return 'success'   # 回调重复推送：幂等处理，不重复延长套餐
         if o:
-            cfg=get_plan_config(True).get(o['plan_id'],PLAN_CONFIG['free']); exp=(dt.datetime.now()+dt.timedelta(days=cfg['days'])).isoformat(); con.execute('UPDATE orders SET status="paid",trade_no=?,paid_at=CURRENT_TIMESTAMP WHERE id=?',(params.get('trade_no',''),o['id'])); con.execute('UPDATE users SET plan=?,plan_expires_at=? WHERE id=?',(o['plan_id'],exp,o['user_id'])); con.commit()
+            try: paid_money=float(params.get('money') or 0)
+            except ValueError: paid_money=-1
+            if abs(paid_money-float(o['amount'] or 0))>0.009:
+                app.logger.warning('epay notify amount mismatch: order=%s expect=%s got=%s', o['order_no'], o['amount'], params.get('money'))
+                return 'fail',400
+            cfg=get_plan_config(True).get(o['plan_id'],PLAN_CONFIG['free']); exp=(dt.datetime.now()+dt.timedelta(days=cfg['days'])).isoformat(); con.execute('UPDATE orders SET status=\'paid\',trade_no=?,paid_at=CURRENT_TIMESTAMP WHERE id=?',(params.get('trade_no',''),o['id'])); con.execute('UPDATE users SET plan=?,plan_expires_at=? WHERE id=?',(o['plan_id'],exp,o['user_id'])); con.commit()
     return 'success'
 
 @app.route('/payment/success')
@@ -2023,7 +2435,7 @@ def admin():
         elif act=='mark_paid':
             o=con.execute('SELECT * FROM orders WHERE id=?',(request.form.get('order_id'),)).fetchone()
             if o:
-                cfg=get_plan_config(True).get(o['plan_id'],PLAN_CONFIG['free']); exp=(dt.datetime.now()+dt.timedelta(days=cfg['days'])).isoformat(); con.execute('UPDATE orders SET status="paid",paid_at=CURRENT_TIMESTAMP WHERE id=?',(o['id'],)); con.execute('UPDATE users SET plan=?,plan_expires_at=? WHERE id=?',(o['plan_id'],exp,o['user_id'])); con.commit(); msg='订单已确认并开通套餐'
+                cfg=get_plan_config(True).get(o['plan_id'],PLAN_CONFIG['free']); exp=(dt.datetime.now()+dt.timedelta(days=cfg['days'])).isoformat(); con.execute('UPDATE orders SET status=\'paid\',paid_at=CURRENT_TIMESTAMP WHERE id=?',(o['id'],)); con.execute('UPDATE users SET plan=?,plan_expires_at=? WHERE id=?',(o['plan_id'],exp,o['user_id'])); con.commit(); msg='订单已确认并开通套餐'
         elif act=='update_order':
             con.execute('UPDATE orders SET plan_id=?,amount=?,payment_method=?,trade_no=?,status=?,paid_at=? WHERE id=?',(request.form.get('plan_id',''),float(request.form.get('amount') or 0),request.form.get('payment_method',''),request.form.get('trade_no',''),request.form.get('status','pending'),request.form.get('paid_at') or None,request.form.get('order_id'))); con.commit(); msg='订单已更新'
         elif act=='delete_order':
@@ -2172,16 +2584,16 @@ def admin():
     # ---- 按上游名称汇总，支持一次性批量维护该上游下所有模型行 ----
     prov_agg={}
     for r in con.execute('SELECT name,provider_type,base_url,api_key,count(*) n,sum(is_active) a,sum(is_default) d FROM model_providers GROUP BY name,provider_type,base_url,api_key'):
-        g=prov_agg.setdefault(r['name'],{'n':0,'a':0,'d':0,'types':set(),'bases':[],'keys':[]})
-        g['n']+=r['n']; g['a']+=r['a'] or 0; g['d']+=r['d'] or 0
-        g['types'].add(r['provider_type'])
-        if r['base_url'] and r['base_url'] not in g['bases']: g['bases'].append(r['base_url'])
-        if r['api_key'] and r['api_key'] not in g['keys']: g['keys'].append(r['api_key'])
+        pg=prov_agg.setdefault(r['name'],{'n':0,'a':0,'d':0,'types':set(),'bases':[],'keys':[]})
+        pg['n']+=r['n']; pg['a']+=r['a'] or 0; pg['d']+=r['d'] or 0
+        pg['types'].add(r['provider_type'])
+        if r['base_url'] and r['base_url'] not in pg['bases']: pg['bases'].append(r['base_url'])
+        if r['api_key'] and r['api_key'] not in pg['keys']: pg['keys'].append(r['api_key'])
     _bulk=[]
-    for nm,g in sorted(prov_agg.items(), key=lambda kv:(-kv[1]['n'], kv[0])):
-        bases='<br>'.join('<span class="key-line">%s</span>'%h(b) for b in g['bases'][:2])+(('<br><span class="muted">…共 %s 个不同地址</span>'%len(g['bases'])) if len(g['bases'])>2 else '')
-        keyinfo=('<br>'.join(h(k[:8]+'…'+k[-4:]) for k in g['keys'][:1])) or '<span class="muted">-</span>'
-        _bulk.append(f'''<tr><td><b>{h(nm)}</b><br><span class="muted">{h('/'.join(sorted(g['types'])))}</span></td><td>{g['n']}</td><td>{g['a']}</td><td>{g['d']}</td><td>{bases}</td><td>{keyinfo}</td><td><form method="post" class="inline-form"><input type="hidden" name="act" value="bulk_models"><input type="hidden" name="provider_name" value="{h(nm)}"><select name="op" class="input mini"><option value="enable">启用全部</option><option value="disable">禁用全部</option><option value="delete">删除全部</option><option value="ocr_off">禁用纯OCR模型</option><option value="default">设为默认模型</option><option value="key">统一改 API Key</option><option value="base">统一改 Base URL</option><option value="timeout">统一改超时秒</option><option value="resort">重排排序号</option><option value="rename">重命名该上游</option></select><input class="input mini" name="value" placeholder="新值（Key/Base/超时/新名称）"><input class="input mini" name="extra" placeholder="可选：默认模型ID / 排序基准"><button class="btn btn2">执行</button></form></td></tr>''')
+    for nm,pg in sorted(prov_agg.items(), key=lambda kv:(-kv[1]['n'], kv[0])):
+        bases='<br>'.join('<span class="key-line">%s</span>'%h(b) for b in pg['bases'][:2])+(('<br><span class="muted">…共 %s 个不同地址</span>'%len(pg['bases'])) if len(pg['bases'])>2 else '')
+        keyinfo=('<br>'.join(h(k[:8]+'…'+k[-4:]) for k in pg['keys'][:1])) or '<span class="muted">-</span>'
+        _bulk.append(f'''<tr><td><b>{h(nm)}</b><br><span class="muted">{h('/'.join(sorted(pg['types'])))}</span></td><td>{pg['n']}</td><td>{pg['a']}</td><td>{pg['d']}</td><td>{bases}</td><td>{keyinfo}</td><td><form method="post" class="inline-form"><input type="hidden" name="act" value="bulk_models"><input type="hidden" name="provider_name" value="{h(nm)}"><select name="op" class="input mini"><option value="enable">启用全部</option><option value="disable">禁用全部</option><option value="delete">删除全部</option><option value="ocr_off">禁用纯OCR模型</option><option value="default">设为默认模型</option><option value="key">统一改 API Key</option><option value="base">统一改 Base URL</option><option value="timeout">统一改超时秒</option><option value="resort">重排排序号</option><option value="rename">重命名该上游</option></select><input class="input mini" name="value" placeholder="新值（Key/Base/超时/新名称）"><input class="input mini" name="extra" placeholder="可选：默认模型ID / 排序基准"><button class="btn btn2">执行</button></form></td></tr>''')
     bulk_html=''.join(_bulk) or '<tr><td colspan="7">暂无模型供应商</td></tr>'
     bulk_section=f'''<h3>按上游批量维护</h3><p class="muted">同一"上游名称"下的模型会被一起处理：换 Key、换 Base URL、批量启停、重命名、重排排序，不用再逐行点保存。</p>
 <table width="100%"><tr><th>上游</th><th>模型数</th><th>启用</th><th>默认</th><th>Base URL</th><th>Key</th><th>批量操作</th></tr>{bulk_html}</table>'''
@@ -2224,17 +2636,45 @@ def admin():
 <div><h4>上游平均耗时</h4><table width="100%"><tr><th>上游</th><th>已测模型</th><th>平均</th><th>最快</th><th>成功/失败</th></tr>{up_rows}</table></div></div>
 <h4>被测速自动停用的模型（{adis_count} 个 · 调用侧不会路由到它们 · 测通自动恢复）</h4><table width="100%"><tr><th>模型</th><th>上游</th><th>停用时间</th></tr>{adis_rows}</table>
 <h4>连续失败 / 从未成功的模型</h4><table width="100%"><tr><th>模型</th><th>上游</th><th>成功/失败</th><th>最近错误</th></tr>{bad_rows}</table>'''
-    body=f'''<div class="card"><h2>管理后台</h2>{'<p class="ok">'+h(msg)+'</p>' if msg else ''}
-<h3>易支付配置</h3><p>当前支付状态：{pay_status}</p><form method="post"><input type="hidden" name="act" value="save_epay"><div class="grid"><div><label>启用支付</label><select class="input" name="payment_enabled"><option value="0" {sel(st.get('payment_enabled'),'0')}>禁用/演示</option><option value="1" {sel(st.get('payment_enabled'),'1')}>启用</option></select></div><div><label>易支付网关</label><input class="input" name="epay_api_url" value="{h(st.get('epay_api_url',''))}" placeholder="https://epay.example.com"></div><div><label>商户 PID</label><input class="input" name="epay_pid" value="{h(st.get('epay_pid',''))}"></div><div><label>商户 Key</label><input class="input" name="epay_key" value="{h(st.get('epay_key',''))}"></div><div><label>域名</label><input class="input" name="domain" value="{h(st.get('domain',''))}"></div><div><label>公网 Base URL</label><input class="input" name="public_base_url" value="{h(st.get('public_base_url',''))}"></div></div><button class="btn">保存易支付配置</button></form>
-<h3>SMTP 邮件配置</h3><form method="post"><input type="hidden" name="act" value="save_smtp"><div class="grid"><div><label>启用 SMTP</label><select class="input" name="smtp_enabled"><option value="0" {sel(st.get('smtp_enabled'),'0')}>禁用</option><option value="1" {sel(st.get('smtp_enabled'),'1')}>启用</option></select></div><div><label>SMTP Host</label><input class="input" name="smtp_host" value="{h(st.get('smtp_host',''))}" placeholder="smtp.example.com"></div><div><label>端口</label><input class="input" name="smtp_port" value="{h(st.get('smtp_port','587'))}"></div><div><label>加密</label><select class="input" name="smtp_encryption"><option value="tls" {sel(st.get('smtp_encryption'),'tls')}>TLS/STARTTLS</option><option value="ssl" {sel(st.get('smtp_encryption'),'ssl')}>SSL</option><option value="none" {sel(st.get('smtp_encryption'),'none')}>不加密</option></select></div><div><label>账号</label><input class="input" name="smtp_username" value="{h(st.get('smtp_username',''))}"></div><div><label>密码/授权码</label><input class="input" name="smtp_password" value="{h(st.get('smtp_password',''))}"></div><div><label>发件邮箱</label><input class="input" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"></div><div><label>发件名称</label><input class="input" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"></div></div><button class="btn">保存 SMTP 配置</button></form><form method="post"><input type="hidden" name="act" value="test_smtp"><input type="hidden" name="smtp_enabled" value="{h(st.get('smtp_enabled','0'))}"><input type="hidden" name="smtp_host" value="{h(st.get('smtp_host',''))}"><input type="hidden" name="smtp_port" value="{h(st.get('smtp_port','587'))}"><input type="hidden" name="smtp_username" value="{h(st.get('smtp_username',''))}"><input type="hidden" name="smtp_password" value="{h(st.get('smtp_password',''))}"><input type="hidden" name="smtp_encryption" value="{h(st.get('smtp_encryption','tls'))}"><input type="hidden" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"><input type="hidden" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"><div class="grid"><div><label>测试收件邮箱</label><input class="input" name="test_email" value="{h(current_user()['email'] or '')}"></div></div><button class="btn btn2">发送测试邮件</button></form>
-{openai_compat_docs_html(st.get('public_base_url') or PUBLIC_BASE_URL)}{bulk_section}{probe_section}<h3>模型配置管理（三方 OpenAI 兼容/Ollama 中转）</h3><p class="muted">OpenAI 兼容供应商支持填写 Base URL + API Key 后自动请求 <code>/models</code> 批量导入模型 ID；多模态能力请按上游真实能力勾选，网关会据此做路由过滤。</p>{discover_form}<table width="100%"><tr><th>ID</th><th>名称/协议</th><th>类型</th><th>Base URL/扩展</th><th>API Key</th><th>模型ID/显示名</th><th>状态</th><th>能力</th><th>排序/超时/Token</th><th>操作</th></tr>{model_html}{new_model}</table>
-<h3>套餐 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>价格</th><th>日额度</th><th>RPM</th><th>天数</th><th>状态</th><th>排序</th><th>说明</th><th>操作</th></tr>{plan_html}{new_plan}</table>
-<h3>管理项目 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>Slug</th><th>说明</th><th>链接</th><th>状态</th><th>排序</th><th>操作</th></tr>{proj_html}{new_proj}</table>
-<h3>用户 / 套餐 / 额度</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>套餐</th><th>自定义额度 / Key数</th><th>到期</th><th>余额</th><th>模型权限</th><th>状态</th><th>今日已用</th><th>操作</th></tr>{uh}</table>
-<h3>API Key 管理</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>Key</th><th>状态</th><th>RPM</th><th>Key日额度</th><th>IP白名单</th><th>模型权限</th><th>最后使用</th><th>操作</th></tr>{kh}</table>
-<h3>订单管理</h3><table width="100%"><tr><th>ID</th><th>订单号</th><th>用户</th><th>套餐</th><th>金额</th><th>方式</th><th>交易号</th><th>状态</th><th>支付时间</th><th>操作</th></tr>{oh}</table>
-<h3>工单管理</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>内容/最近消息</th><th>分类</th><th>优先级</th><th>状态/回复</th></tr>{th}</table>
-<h3>用量排行</h3><form method="post"><input type="hidden" name="act" value="clear_usage_logs"><button class="btn btn-danger">清理全部调用日志/重置今日用量</button></form><table width="100%"><tr><th>用户</th><th>调用次数</th><th>总 Tokens</th><th>最后调用</th></tr>{usage_html}</table></div>'''
+    _ov=con.execute("SELECT (SELECT count(*) FROM users) users,(SELECT count(*) FROM users WHERE date(created_at)=date('now','localtime')) users_today,(SELECT count(*) FROM api_keys WHERE is_active=1) keys_active,(SELECT count(*) FROM model_providers WHERE is_active=1) models_active,(SELECT count(*) FROM model_providers) models_total,(SELECT count(*) FROM tickets WHERE status<>'closed') tickets_open,(SELECT COALESCE(sum(amount),0) FROM orders WHERE status='paid') revenue,(SELECT count(*) FROM orders WHERE status='pending') orders_pending").fetchone()
+    _td=dt.date.today().isoformat()
+    _today=con.execute("SELECT count(*) calls,COALESCE(sum(tokens_input+tokens_output),0) tok,COALESCE(avg(duration_ms),0) avg_ms FROM usage_logs WHERE substr(created_at,1,10)>=?",(_td,)).fetchone()
+    _since=(dt.date.today()-dt.timedelta(days=13)).isoformat()
+    _drows={r['d']:r for r in con.execute("SELECT substr(created_at,1,10) d,count(*) calls,COALESCE(sum(tokens_input+tokens_output),0) tok FROM usage_logs WHERE created_at>=? GROUP BY d",(_since,)).fetchall()}
+    _days=[(dt.date.today()-dt.timedelta(days=i)).isoformat() for i in range(13,-1,-1)]
+    _vals=[int(_drows[d]['calls']) if d in _drows else 0 for d in _days]; _vmax=max(_vals) or 1
+    _spark=''.join(f'<div title="{d}：{v:,} 次调用"><i style="height:{max(2,int(v*100/_vmax))}%"></i><span>{d[8:]}</span></div>' for d,v in zip(_days,_vals))
+    _topm=con.execute("SELECT model,count(*) c,COALESCE(sum(tokens_input+tokens_output),0) tok,COALESCE(avg(duration_ms),0) ms FROM usage_logs WHERE created_at>=? AND model<>'' GROUP BY model ORDER BY c DESC LIMIT 8",(_since,)).fetchall()
+    _topm_html=''.join(f'<tr><td><b>{h(r["model"])}</b></td><td>{int(r["c"]):,}</td><td>{int(r["tok"]):,}</td><td>{int(r["ms"]):,} ms</td></tr>' for r in _topm) or '<tr><td colspan="4" class="muted">近 14 天暂无调用</td></tr>'
+    _weak=''
+    try:
+        _adm=current_user()
+        if _adm and check_password_hash(_adm['password_hash'],'admin123'):
+            _weak='<div class="alert alert-bad"><b>安全提醒：</b>当前管理员仍在使用默认密码 admin123，请在「用户」页签立即修改。</div>'
+    except Exception: pass
+    _msg_html=(f'<div class="alert {"alert-bad" if ("失败" in msg or "错误" in msg) else "alert-ok"}">{h(msg)}</div>' if msg else '')
+    _tabs=[('overview','概览'),('models','模型与上游'),('probe','测速 / 智能选路'),('users','用户与 Key'),('billing','套餐与订单'),('tickets','工单'+(f' <span class="pill pill-warn">{_ov["tickets_open"]}</span>' if _ov['tickets_open'] else '')),('system','系统设置'),('docs','接入文档')]
+    _tabnav='<nav class="tabs">'+''.join(f'<a href="#{k}" data-tab="{k}">{v}</a>' for k,v in _tabs)+'</nav>'
+    overview=f'''<div class="grid-4">
+<div class="card stat-card"><span class="ico">👥</span><span class="label">用户总数</span><span class="value">{_ov["users"]:,}</span><span class="sub">今日新增 {_ov["users_today"]:,}</span></div>
+<div class="card stat-card"><span class="ico">🧠</span><span class="label">启用模型</span><span class="value">{_ov["models_active"]:,} <small class="muted" style="font-size:13px">/ {_ov["models_total"]:,}</small></span><span class="sub">自动停用 {adis_count} 个</span></div>
+<div class="card stat-card"><span class="ico">⚡</span><span class="label">今日调用</span><span class="value">{int(_today["calls"]):,}</span><span class="sub">{int(_today["tok"]):,} tokens · 平均 {int(_today["avg_ms"]):,} ms</span></div>
+<div class="card stat-card"><span class="ico">¥</span><span class="label">累计收入</span><span class="value">¥{float(_ov["revenue"]):,.2f}</span><span class="sub">待支付订单 {_ov["orders_pending"]:,} · 启用 Key {_ov["keys_active"]:,}</span></div>
+</div>
+<div class="two"><div class="card"><div class="card-head"><h3>近 14 天调用量</h3><span class="muted">{sum(_vals):,} 次</span></div><div class="spark">{_spark}</div></div>
+<div class="card"><h3>热门模型（近 14 天）</h3><table><tr><th>模型</th><th>调用</th><th>Tokens</th><th>平均耗时</th></tr>{_topm_html}</table></div></div>
+<div class="card"><h3>支付状态</h3><p>{pay_status}</p>{auto_pick}<div class="btn-row"><a class="btn btn2 btn-sm" href="/envz" target="_blank">/envz 自检</a><a class="btn btn2 btn-sm" href="/health" target="_blank">/health</a><a class="btn btn2 btn-sm" href="/v1/models" target="_blank">/v1/models</a></div></div>'''
+    def _pane(k,inner): return f'<section class="tab-pane" id="tab-{k}">{inner}</section>'
+    body=(f'''<div class="section-head" style="margin-top:0"><div><h2>管理后台</h2><p class="muted" style="margin:4px 0 0">版本 {h(BUILD_TAG)} · {h(public_base_url())}</p></div></div>{_weak}{_msg_html}{_tabnav}'''
+        +_pane('overview',f'''{overview}''')
+        +_pane('models',f'''<div class="card">{bulk_section}</div><div class="card"><h3>模型配置管理（三方 OpenAI 兼容/Ollama 中转）</h3><p class="muted">OpenAI 兼容供应商支持填写 Base URL + API Key 后自动请求 <code>/models</code> 批量导入模型 ID；多模态能力请按上游真实能力勾选，网关会据此做路由过滤。</p>{discover_form}<table width="100%"><tr><th>ID</th><th>名称/协议</th><th>类型</th><th>Base URL/扩展</th><th>API Key</th><th>模型ID/显示名</th><th>状态</th><th>能力</th><th>排序/超时/Token</th><th>操作</th></tr>{model_html}{new_model}</table></div>''')
+        +_pane('probe',f'''<div class="card">{probe_section}</div>''')
+        +_pane('users',f'''<div class="card"><h3>用户 / 套餐 / 额度</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>套餐</th><th>自定义额度 / Key数</th><th>到期</th><th>余额</th><th>模型权限</th><th>状态</th><th>今日已用</th><th>操作</th></tr>{uh}</table></div><div class="card"><h3>API Key 管理</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>Key</th><th>状态</th><th>RPM</th><th>Key日额度</th><th>IP白名单</th><th>模型权限</th><th>最后使用</th><th>操作</th></tr>{kh}</table></div>''')
+        +_pane('billing',f'''<div class="card"><h3>易支付配置</h3><p>当前支付状态：{pay_status}</p><form method="post"><input type="hidden" name="act" value="save_epay"><div class="grid"><div><label>启用支付</label><select class="input" name="payment_enabled"><option value="0" {sel(st.get('payment_enabled'),'0')}>禁用/演示</option><option value="1" {sel(st.get('payment_enabled'),'1')}>启用</option></select></div><div><label>易支付网关</label><input class="input" name="epay_api_url" value="{h(st.get('epay_api_url',''))}" placeholder="https://epay.example.com"></div><div><label>商户 PID</label><input class="input" name="epay_pid" value="{h(st.get('epay_pid',''))}"></div><div><label>商户 Key</label><input class="input" name="epay_key" value="{h(st.get('epay_key',''))}"></div><div><label>域名</label><input class="input" name="domain" value="{h(st.get('domain',''))}"></div><div><label>公网 Base URL</label><input class="input" name="public_base_url" value="{h(st.get('public_base_url',''))}"></div></div><button class="btn">保存易支付配置</button></form></div><div class="card"><h3>套餐 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>价格</th><th>日额度</th><th>RPM</th><th>天数</th><th>状态</th><th>排序</th><th>说明</th><th>操作</th></tr>{plan_html}{new_plan}</table></div><div class="card"><h3>订单管理</h3><table width="100%"><tr><th>ID</th><th>订单号</th><th>用户</th><th>套餐</th><th>金额</th><th>方式</th><th>交易号</th><th>状态</th><th>支付时间</th><th>操作</th></tr>{oh}</table></div>''')
+        +_pane('tickets',f'''<div class="card"><h3>工单管理</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>内容/最近消息</th><th>分类</th><th>优先级</th><th>状态/回复</th></tr>{th}</table></div>''')
+        +_pane('system',f'''<div class="card"><h3>SMTP 邮件配置</h3><form method="post"><input type="hidden" name="act" value="save_smtp"><div class="grid"><div><label>启用 SMTP</label><select class="input" name="smtp_enabled"><option value="0" {sel(st.get('smtp_enabled'),'0')}>禁用</option><option value="1" {sel(st.get('smtp_enabled'),'1')}>启用</option></select></div><div><label>SMTP Host</label><input class="input" name="smtp_host" value="{h(st.get('smtp_host',''))}" placeholder="smtp.example.com"></div><div><label>端口</label><input class="input" name="smtp_port" value="{h(st.get('smtp_port','587'))}"></div><div><label>加密</label><select class="input" name="smtp_encryption"><option value="tls" {sel(st.get('smtp_encryption'),'tls')}>TLS/STARTTLS</option><option value="ssl" {sel(st.get('smtp_encryption'),'ssl')}>SSL</option><option value="none" {sel(st.get('smtp_encryption'),'none')}>不加密</option></select></div><div><label>账号</label><input class="input" name="smtp_username" value="{h(st.get('smtp_username',''))}"></div><div><label>密码/授权码</label><input class="input" name="smtp_password" value="{h(st.get('smtp_password',''))}"></div><div><label>发件邮箱</label><input class="input" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"></div><div><label>发件名称</label><input class="input" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"></div></div><button class="btn">保存 SMTP 配置</button></form><form method="post"><input type="hidden" name="act" value="test_smtp"><input type="hidden" name="smtp_enabled" value="{h(st.get('smtp_enabled','0'))}"><input type="hidden" name="smtp_host" value="{h(st.get('smtp_host',''))}"><input type="hidden" name="smtp_port" value="{h(st.get('smtp_port','587'))}"><input type="hidden" name="smtp_username" value="{h(st.get('smtp_username',''))}"><input type="hidden" name="smtp_password" value="{h(st.get('smtp_password',''))}"><input type="hidden" name="smtp_encryption" value="{h(st.get('smtp_encryption','tls'))}"><input type="hidden" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"><input type="hidden" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"><div class="grid"><div><label>测试收件邮箱</label><input class="input" name="test_email" value="{h(current_user()['email'] or '')}"></div></div><button class="btn btn2">发送测试邮件</button></form></div><div class="card"><h3>管理项目 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>Slug</th><th>说明</th><th>链接</th><th>状态</th><th>排序</th><th>操作</th></tr>{proj_html}{new_proj}</table></div><div class="card"><h3>用量排行</h3><form method="post"><input type="hidden" name="act" value="clear_usage_logs"><button class="btn btn-danger">清理全部调用日志/重置今日用量</button></form><table width="100%"><tr><th>用户</th><th>调用次数</th><th>总 Tokens</th><th>最后调用</th></tr>{usage_html}</table></div>''')
+        +_pane('docs',f'''{openai_compat_docs_html(st.get('public_base_url') or PUBLIC_BASE_URL)}''')
+    )
     return page(body)
 
 @app.route('/health')
@@ -2333,9 +2773,7 @@ def run_gateway_request(payload, target_api='chat_completions'):
             if auto_mode and not payload.get('stream'):
                 try:
                     _data=json.loads(resp.get_data().decode('utf-8'))
-                    _ch=(_data.get('choices') or [{}])[0] or {}
-                    _msg=_ch.get('message') or {}
-                    if not (_msg.get('content') or '').strip() and not _msg.get('tool_calls'):
+                    if not response_text_any(_data).strip():
                         record_model_result(provider['id'],False,round((time.time()-t_try)*1000),'empty completion')
                         errors.append({'provider':provider['name'],'model':provider['model_id'],'error':'empty completion (auto retry)'})
                         continue
