@@ -37,7 +37,7 @@ ADMIN_UNLIMITED = (os.environ.get('ADMIN_UNLIMITED') or '1').strip().lower() not
 ADMIN_PLAN = (os.environ.get('ADMIN_PLAN') or 'enterprise').strip()
 SITE_NAME = os.environ.get('SITE_NAME', 'LLM Platform')
 # 构建标记：每次改完代码手动 +1，/healthz 与 /k 里能看到，用来确认"线上到底跑的是哪一版"
-BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-10-09.1300'
+BUILD_TAG = (os.environ.get('BUILD_TAG') or '').strip() or '2026-10-13.0308'
 def _load_secret_key():
     """FLASK_SECRET_KEY 未设置时持久化到数据目录，避免重启/多 worker 导致所有用户被登出。"""
     env=(os.environ.get('FLASK_SECRET_KEY') or '').strip()
