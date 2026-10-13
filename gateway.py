@@ -483,7 +483,7 @@ def has_request_context_safe():
 def page(body):
     u=current_user() if has_request_context_safe() else None
     brand=('<a class="brand" href="/"><span class="brand-logo">LLM</span>'
-           f'<span class="brand-text">{h(SITE_NAME)}<small>OpenAI 兼容大模型网关</small></span></a>')
+           f'<span class="brand-text">{h(site_name())}<small>OpenAI 兼容大模型网关</small></span></a>')
     if u:
         admin_links='<a href="/admin">管理后台</a>' if u['is_admin'] else ''
         menu=(f'<nav class="menu"><a href="/">首页</a><a href="/dashboard">用户控制台</a><a href="/playground">聊天测试</a>'
@@ -494,7 +494,11 @@ def page(body):
         menu='<nav class="menu"><a href="/">首页</a><a href="/#pricing">套餐</a><a href="/#models">模型广场</a><a href="/v1/models">模型列表</a><a href="/health">服务状态</a></nav>'
         chip='<div class="user-chip"><button class="icon-btn" id="themeBtn" type="button" title="切换深色/浅色">☾</button><a class="btn btn2 btn-sm" href="/login">登录</a><a class="btn btn-sm" href="/register">注册</a><button class="icon-btn nav-toggle" id="navToggle" type="button" aria-label="菜单">☰</button></div>'
     nav=f'<header class="topbar"><div class="topbar-inner">{brand}{menu}{chip}</div></header>'
-    html_out = render_template_string(HTML, body=body, nav=nav, site_name=h(SITE_NAME), build=h(BUILD_TAG))
+    html_out = render_template_string(HTML, body=body, nav=nav, site_name=h(site_name()), build=h(BUILD_TAG))
+    if has_request_context_safe() and not registration_open():
+        html_out = html_out.replace('<a class="btn btn-sm" href="/register">注册</a>','')
+        html_out = html_out.replace('还没有账号？<a href="/register">免费注册</a>','当前暂未开放注册')
+        html_out = re.sub(r'<a class="([^"]*)" href="/register">[^<]*</a>', lambda m: '<a class="%s" href="/login">登录</a>'%m.group(1), html_out)
     return inject_csrf(html_out) if has_request_context_safe() else html_out
 
 def db():
@@ -556,7 +560,7 @@ CREATE TABLE IF NOT EXISTS email_activations(id INTEGER PRIMARY KEY AUTOINCREMEN
     ]:
         try: c.execute(ddl)
         except sqlite3.OperationalError: pass
-    for k,v in {'epay_api_url': EPAY_API_URL, 'epay_pid': EPAY_PID, 'epay_key': EPAY_KEY, 'domain': DOMAIN, 'public_base_url': PUBLIC_BASE_URL, 'payment_enabled': '0' if not (EPAY_API_URL and EPAY_PID and EPAY_KEY) else '1', 'smtp_enabled': os.environ.get('SMTP_ENABLED','0'), 'smtp_host': os.environ.get('SMTP_HOST',''), 'smtp_port': os.environ.get('SMTP_PORT','587'), 'smtp_username': os.environ.get('SMTP_USERNAME',''), 'smtp_password': os.environ.get('SMTP_PASSWORD',''), 'smtp_encryption': os.environ.get('SMTP_ENCRYPTION','tls'), 'smtp_from_email': os.environ.get('SMTP_FROM_EMAIL',''), 'smtp_from_name': os.environ.get('SMTP_FROM_NAME','LLM Platform')}.items():
+    for k,v in {'epay_api_url': EPAY_API_URL, 'epay_pid': EPAY_PID, 'epay_key': EPAY_KEY, 'domain': DOMAIN, 'public_base_url': PUBLIC_BASE_URL, 'payment_enabled': '0' if not (EPAY_API_URL and EPAY_PID and EPAY_KEY) else '1', 'smtp_enabled': os.environ.get('SMTP_ENABLED','0'), 'smtp_host': os.environ.get('SMTP_HOST',''), 'smtp_port': os.environ.get('SMTP_PORT','587'), 'smtp_username': os.environ.get('SMTP_USERNAME',''), 'smtp_password': os.environ.get('SMTP_PASSWORD',''), 'smtp_encryption': os.environ.get('SMTP_ENCRYPTION','tls'), 'smtp_from_email': os.environ.get('SMTP_FROM_EMAIL',''), 'smtp_from_name': os.environ.get('SMTP_FROM_NAME','LLM Platform'), 'registration_enabled': os.environ.get('REGISTRATION_ENABLED','1'), 'registration_closed_msg': '', 'default_plan': 'free', 'site_name': '', 'auto_backup_enabled': '0', 'auto_backup_hours': '24', 'backup_keep': '10'}.items():
         c.execute('INSERT OR IGNORE INTO app_settings(key,value) VALUES(?,?)', (k, v or ''))
     _plans=plan_config_from_env(); _pov=plan_env_overrides()
     for idx,(pid,cfg) in enumerate(_plans.items()):
@@ -830,11 +834,122 @@ def get_settings():
     data={r['key']:r['value'] for r in rows}
     data.setdefault('epay_api_url', EPAY_API_URL); data.setdefault('epay_pid', EPAY_PID); data.setdefault('epay_key', EPAY_KEY)
     data.setdefault('domain', DOMAIN); data.setdefault('public_base_url', PUBLIC_BASE_URL); data.setdefault('payment_enabled','0')
+    data.setdefault('registration_enabled','1'); data.setdefault('registration_closed_msg',''); data.setdefault('default_plan','free'); data.setdefault('site_name','')
+    data.setdefault('auto_backup_enabled','0'); data.setdefault('auto_backup_hours','24'); data.setdefault('backup_keep','10')
     data.setdefault('smtp_enabled','0'); data.setdefault('smtp_host',''); data.setdefault('smtp_port','587'); data.setdefault('smtp_username',''); data.setdefault('smtp_password',''); data.setdefault('smtp_encryption','tls'); data.setdefault('smtp_from_email',''); data.setdefault('smtp_from_name','LLM Platform')
     return data
 
 def set_setting(key,value):
     db().execute('INSERT INTO app_settings(key,value,updated_at) VALUES(?,?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP',(key,value or ''))
+
+def registration_open():
+    try: return (get_settings().get('registration_enabled') or '1')=='1'
+    except Exception: return True
+
+def site_name():
+    try: return (get_settings().get('site_name') or '').strip() or SITE_NAME
+    except Exception: return SITE_NAME
+
+# ---------- 数据备份 / 恢复 ----------
+BACKUP_DIR = os.path.join(DATA_DIR, 'backups')
+_BACKUP_NAME_RE = re.compile(r'^platform-\d{8}-\d{6}(?:-[a-z0-9-]{1,32})?\.db$')
+_BACKUP_LOCK = threading.Lock()
+
+def backup_path(name):
+    name=os.path.basename(name or '')
+    if not _BACKUP_NAME_RE.match(name): raise ValueError('备份文件名不合法')
+    return os.path.join(BACKUP_DIR, name)
+
+def create_backup(tag='manual'):
+    """用 SQLite 在线备份 API 生成一致性快照（运行中也安全，含 WAL 内未落盘的数据）。"""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    tag=re.sub(r'[^a-z0-9-]','',(tag or 'manual').lower())[:32] or 'manual'
+    with _BACKUP_LOCK:
+        name='platform-%s-%s.db'%(dt.datetime.now().strftime('%Y%m%d-%H%M%S'),tag)
+        path=os.path.join(BACKUP_DIR,name); i=1
+        while os.path.exists(path):
+            name='platform-%s-%s%d.db'%(dt.datetime.now().strftime('%Y%m%d-%H%M%S'),tag,i); path=os.path.join(BACKUP_DIR,name); i+=1
+        src=sqlite3.connect(DB_PATH, timeout=30); dst=sqlite3.connect(path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close(); src.close()
+    return name
+
+def list_backups():
+    if not os.path.isdir(BACKUP_DIR): return []
+    out=[]
+    for n in os.listdir(BACKUP_DIR):
+        if _BACKUP_NAME_RE.match(n):
+            p=os.path.join(BACKUP_DIR,n); st=os.stat(p)
+            out.append({'name':n,'size':st.st_size,'mtime':dt.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M:%S')})
+    return sorted(out,key=lambda x:x['name'],reverse=True)
+
+def prune_backups(keep=None):
+    try: keep=int(keep if keep is not None else (get_settings().get('backup_keep') or 10))
+    except Exception: keep=10
+    keep=max(1,keep); removed=0
+    # 只自动清理定时备份和手动备份；"恢复前自动备份"永远保留最近 3 个
+    autos=[b for b in list_backups() if not b['name'].endswith('-pre-restore.db')]
+    for b in autos[keep:]:
+        try: os.remove(os.path.join(BACKUP_DIR,b['name'])); removed+=1
+        except OSError: pass
+    pres=[b for b in list_backups() if b['name'].endswith('-pre-restore.db')]
+    for b in pres[3:]:
+        try: os.remove(os.path.join(BACKUP_DIR,b['name'])); removed+=1
+        except OSError: pass
+    return removed
+
+def validate_backup_file(path):
+    """校验是不是本平台的 SQLite 数据库：完整性检查 + 必要的表。返回 (ok, 说明)。"""
+    try:
+        with open(path,'rb') as f:
+            if f.read(16)!=b'SQLite format 3\x00': return False,'不是 SQLite 数据库文件'
+        con=sqlite3.connect('file:%s?mode=ro'%path, uri=True, timeout=10)
+        try:
+            ic=con.execute('PRAGMA integrity_check').fetchone()[0]
+            if ic!='ok': return False,'数据库完整性检查失败：%s'%ic
+            tables={r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            need={'users','api_keys','app_settings','plans'}
+            if not need<=tables: return False,'缺少必要的表：%s'%'、'.join(sorted(need-tables))
+            if not con.execute('SELECT 1 FROM users WHERE is_admin=1 LIMIT 1').fetchone(): return False,'备份里没有管理员账号，恢复后将无法登录后台'
+            n=con.execute('SELECT count(*) FROM users').fetchone()[0]
+        finally: con.close()
+        return True,'%d 个用户'%n
+    except sqlite3.Error as e:
+        return False,'读取失败：%s'%e
+
+def restore_backup_file(path):
+    """先自动备份当前库，再用在线备份 API 把备份内容写回正在使用的库（多 worker 下也安全）。"""
+    ok,info=validate_backup_file(path)
+    if not ok: raise ValueError(info)
+    pre=create_backup('pre-restore')
+    src=sqlite3.connect('file:%s?mode=ro'%path, uri=True, timeout=30); dst=sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        with _BACKUP_LOCK:
+            src.backup(dst)
+    finally:
+        dst.close(); src.close()
+    init_db()  # 旧版本备份补齐新字段/新配置项
+    return pre,info
+
+def _auto_backup_loop():
+    time.sleep(90)
+    while True:
+        try:
+            con=sqlite3.connect(DB_PATH, timeout=20)
+            st={k:v for k,v in con.execute("SELECT key,value FROM app_settings WHERE key IN ('auto_backup_enabled','auto_backup_hours','backup_keep')")}
+            con.close()
+            if st.get('auto_backup_enabled')=='1':
+                try: hours=max(1,int(st.get('auto_backup_hours') or 24))
+                except Exception: hours=24
+                autos=[b for b in list_backups() if b['name'].endswith('-auto.db')]
+                last=os.path.getmtime(os.path.join(BACKUP_DIR,autos[0]['name'])) if autos else 0
+                if time.time()-last>=hours*3600:
+                    create_backup('auto'); prune_backups(st.get('backup_keep') or 10)
+        except Exception as e:
+            print('[backup] 自动备份失败：',e)
+        time.sleep(600)
 
 def get_plan_config(include_inactive=False):
     where='' if include_inactive else ' WHERE is_active=1'
@@ -1975,6 +2090,7 @@ def _ollama_probe_loop():
             _OLLAMA_PROBE['ok']=False
         time.sleep(60)
 threading.Thread(target=_ollama_probe_loop,name='ollama-probe',daemon=True).start()
+threading.Thread(target=_auto_backup_loop,name='auto-backup',daemon=True).start()
 
 def ollama_status_html():
     ok=_OLLAMA_PROBE['ok']
@@ -2070,6 +2186,9 @@ def login():
 @app.route('/register',methods=['GET','POST'])
 def register():
     msg=''
+    if not registration_open():
+        note=(get_settings().get('registration_closed_msg') or '').strip() or '本站暂未开放注册，如需账号请联系管理员。'
+        return auth_card('暂停注册','当前不接受新用户注册','<div class="alert alert-warn">%s</div><p><a class="btn" href="/login">已有账号，去登录</a></p>'%h(note)),403
     if request.method=='POST':
         username=request.form.get('username','').strip(); email=request.form.get('email','').strip(); pw=request.form.get('password','')
         if not re.match(r'^[a-zA-Z0-9_]{3,32}$',username): msg='<p class="bad">用户名 3-32 位字母数字下划线</p>'
@@ -2078,7 +2197,9 @@ def register():
         else:
             try:
                 con=db(); mail_on=(get_settings().get('smtp_enabled')=='1')
-                cur=con.execute('INSERT INTO users(username,email,password_hash,invite_code,tokens_reset_date,is_active) VALUES(?,?,?,?,?,?)',(username,email,generate_password_hash(pw),secrets.token_hex(6).upper(),dt.date.today().isoformat(),1 if not mail_on else 0)); con.commit()
+                _dp=(get_settings().get('default_plan') or 'free').strip() or 'free'
+                if not con.execute('SELECT 1 FROM plans WHERE id=?',(_dp,)).fetchone(): _dp='free'
+                cur=con.execute('INSERT INTO users(username,email,password_hash,invite_code,tokens_reset_date,is_active,plan) VALUES(?,?,?,?,?,?,?)',(username,email,generate_password_hash(pw),secrets.token_hex(6).upper(),dt.date.today().isoformat(),1 if not mail_on else 0,_dp)); con.commit()
                 if mail_on:
                     send_activation_email(cur.lastrowid,email)
                     return auth_card('注册成功','还需一步：完成邮箱验证','<p class="ok">激活邮件已发送，请点击邮件里的链接完成注册。</p><p><a class="btn" href="/login">去登录</a></p>')
@@ -2400,7 +2521,51 @@ def admin():
     con=db(); msg=''
     if request.method=='POST':
         act=request.form.get('act')
-        if act=='save_epay':
+        if act=='save_site':
+            for k in ['registration_enabled','registration_closed_msg','default_plan','site_name']: set_setting(k,request.form.get(k,'').strip())
+            con.commit(); msg='站点与注册设置已保存（注册：%s）'%('开放' if request.form.get('registration_enabled')=='1' else '关闭')
+        elif act=='save_backup_cfg':
+            try: _hrs=str(max(1,int(request.form.get('auto_backup_hours') or 24))); _keep=str(max(1,min(200,int(request.form.get('backup_keep') or 10))))
+            except ValueError: _hrs,_keep='24','10'
+            set_setting('auto_backup_enabled','1' if request.form.get('auto_backup_enabled')=='1' else '0'); set_setting('auto_backup_hours',_hrs); set_setting('backup_keep',_keep)
+            con.commit(); msg='自动备份设置已保存'
+        elif act=='create_backup':
+            try: _n=create_backup('manual'); prune_backups(); msg='备份已创建：'+_n
+            except Exception as e: msg='备份失败：'+str(e)
+        elif act=='delete_backup':
+            try: os.remove(backup_path(request.form.get('name'))); msg='备份已删除'
+            except Exception as e: msg='删除失败：'+str(e)
+        elif act=='restore_backup':
+            if request.form.get('confirm')!='RESTORE': msg='恢复失败：请在确认框输入 RESTORE'
+            else:
+                try:
+                    con.close(); g.pop('db',None)
+                    _pre,_info=restore_backup_file(backup_path(request.form.get('name')))
+                    session.clear()
+                    return page('<div class="card"><h2>恢复完成</h2><p class="ok">已从备份恢复（%s）。恢复前的数据已自动保存为 <code>%s</code>。</p><p class="muted">数据已切换，请重新登录（账号密码以备份中的为准）。</p><a class="btn" href="/login">重新登录</a></div>'%(h(_info),h(_pre)))
+                except Exception as e: con=db(); msg='恢复失败：'+str(e)
+        elif act=='upload_restore':
+            f=request.files.get('dbfile')
+            if request.form.get('confirm')!='RESTORE': msg='恢复失败：请在确认框输入 RESTORE'
+            elif not f or not f.filename: msg='恢复失败：请选择备份文件'
+            else:
+                os.makedirs(BACKUP_DIR, exist_ok=True)
+                _tmp=os.path.join(BACKUP_DIR,'.upload-%s.db'%secrets.token_hex(6))
+                try:
+                    f.save(_tmp)
+                    _ok,_info=validate_backup_file(_tmp)
+                    if not _ok: raise ValueError(_info)
+                    _keep_name='platform-%s-uploaded.db'%dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+                    os.replace(_tmp,os.path.join(BACKUP_DIR,_keep_name))
+                    con.close(); g.pop('db',None)
+                    _pre,_info=restore_backup_file(os.path.join(BACKUP_DIR,_keep_name))
+                    session.clear()
+                    return page('<div class="card"><h2>恢复完成</h2><p class="ok">已从上传的备份恢复（%s）。恢复前的数据已自动保存为 <code>%s</code>。</p><p class="muted">请重新登录（账号密码以备份中的为准）。</p><a class="btn" href="/login">重新登录</a></div>'%(h(_info),h(_pre)))
+                except Exception as e:
+                    try: os.remove(_tmp)
+                    except OSError: pass
+                    con=db(); msg='恢复失败：'+str(e)
+        elif act=='save_epay':
             for k in ['epay_api_url','epay_pid','epay_key','domain','public_base_url','payment_enabled']: set_setting(k,request.form.get(k,''))
             con.commit(); msg='易支付配置已保存'
         elif act=='save_smtp':
@@ -2665,6 +2830,31 @@ def admin():
 <div class="card"><h3>热门模型（近 14 天）</h3><table><tr><th>模型</th><th>调用</th><th>Tokens</th><th>平均耗时</th></tr>{_topm_html}</table></div></div>
 <div class="card"><h3>支付状态</h3><p>{pay_status}</p>{auto_pick}<div class="btn-row"><a class="btn btn2 btn-sm" href="/envz" target="_blank">/envz 自检</a><a class="btn btn2 btn-sm" href="/health" target="_blank">/health</a><a class="btn btn2 btn-sm" href="/v1/models" target="_blank">/v1/models</a></div></div>'''
     def _pane(k,inner): return f'<section class="tab-pane" id="tab-{k}">{inner}</section>'
+    _reg_on=st.get('registration_enabled','1')=='1'
+    _plan_sel=''.join(f'<option value="{h(pid)}" {sel(st.get("default_plan") or "free",pid)}>{h(pid)} · {h(v["name"])}</option>' for pid,v in get_plan_config(True).items())
+    site_section=f'''<div class="card"><div class="card-head"><h3>站点与注册</h3><span class="pill {'pill-green' if _reg_on else 'pill-warn'}">注册{'开放中' if _reg_on else '已关闭'}</span></div>
+<form method="post"><input type="hidden" name="act" value="save_site"><div class="grid">
+<div><label>开放注册</label><select class="input" name="registration_enabled"><option value="1" {sel(st.get('registration_enabled','1'),'1')}>开放：任何人可注册</option><option value="0" {sel(st.get('registration_enabled','1'),'0')}>关闭：只能由管理员创建/保留现有账号</option></select></div>
+<div><label>新用户默认套餐</label><select class="input" name="default_plan">{_plan_sel}</select></div>
+<div><label>站点名称（留空用环境变量 SITE_NAME）</label><input class="input" name="site_name" value="{h(st.get('site_name',''))}" placeholder="{h(SITE_NAME)}"></div>
+<div><label>关闭注册时的提示语</label><input class="input" name="registration_closed_msg" value="{h(st.get('registration_closed_msg',''))}" placeholder="本站暂未开放注册，如需账号请联系管理员。"></div>
+</div><p class="muted">关闭后：首页、导航和登录页的注册入口自动隐藏，直接访问 /register 会显示提示语；已有用户登录、调用 API 不受影响。开启 SMTP 时新注册用户需邮箱激活。</p><button class="btn">保存设置</button></form></div>'''
+    _bks=list_backups()
+    def _sz(n): return ('%.1f MB'%(n/1048576)) if n>=1048576 else ('%.1f KB'%(n/1024))
+    _kind=lambda n: '自动' if n.endswith('-auto.db') else ('恢复前' if n.endswith('-pre-restore.db') else ('上传' if n.endswith('-uploaded.db') else '手动'))
+    _bk_rows=''.join(f'''<tr><td><code>{h(b["name"])}</code></td><td><span class="pill">{_kind(b["name"])}</span></td><td>{_sz(b["size"])}</td><td>{h(b["mtime"])}</td><td><div class="btn-row"><a class="btn btn2 btn-sm" href="/admin/backup/download?name={h(b["name"])}">下载</a>
+<form method="post" class="inline-form" onsubmit="var v=prompt('将用这个备份覆盖当前全部数据（用户、Key、订单、模型配置等）。恢复前会自动再备份一次。\\n确认请输入 RESTORE');if(v!=='RESTORE')return false;this.confirm.value=v;"><input type="hidden" name="act" value="restore_backup"><input type="hidden" name="name" value="{h(b["name"])}"><input type="hidden" name="confirm" value=""><button class="btn btn-sm no-lock">恢复</button></form>
+<form method="post" class="inline-form"><input type="hidden" name="act" value="delete_backup"><input type="hidden" name="name" value="{h(b["name"])}"><button class="btn btn-danger btn-sm" data-confirm="删除这个备份文件？">删除</button></form></div></td></tr>''' for b in _bks) or '<tr><td colspan="5" class="muted">还没有备份，点「立即备份」创建第一个</td></tr>'
+    try: _dbsize=_sz(os.path.getsize(DB_PATH))
+    except OSError: _dbsize='-'
+    backup_section=f'''<div class="card"><div class="card-head"><h3>数据备份与恢复</h3><span class="muted">当前数据库 {_dbsize} · 备份 {len(_bks)} 个</span></div>
+<p class="muted">备份是整个 SQLite 数据库的一致性快照（用户、API Key、订单、套餐、模型与上游配置、系统设置、调用日志），运行中备份也安全。备份里含上游 API Key 和支付密钥，请妥善保管下载的文件。</p>
+<div class="btn-row" style="margin:8px 0 14px"><form method="post" class="inline-form"><input type="hidden" name="act" value="create_backup"><button class="btn">立即备份</button></form><a class="btn btn2" href="/admin/backup/download?name=now">备份并下载</a></div>
+<table width="100%"><tr><th>文件</th><th>类型</th><th>大小</th><th>时间</th><th>操作</th></tr>{_bk_rows}</table>
+<h4 style="margin-top:18px">从文件恢复</h4>
+<form method="post" enctype="multipart/form-data" onsubmit="var v=prompt('上传的备份将覆盖当前全部数据，恢复前会自动备份当前数据。\\n确认请输入 RESTORE');if(v!=='RESTORE')return false;this.confirm.value=v;"><input type="hidden" name="act" value="upload_restore"><input type="hidden" name="confirm" value=""><div class="grid"><div><label>备份文件（.db）</label><input class="input" type="file" name="dbfile" accept=".db,.sqlite,.sqlite3,application/octet-stream"></div><div style="align-self:end"><button class="btn no-lock">上传并恢复</button></div></div><p class="muted">会先校验文件（SQLite 完整性、必要的表、至少一个管理员），不合格不会动当前数据。恢复后需要重新登录。</p></form>
+<h4 style="margin-top:18px">自动备份</h4>
+<form method="post"><input type="hidden" name="act" value="save_backup_cfg"><div class="grid"><div><label>定时自动备份</label><select class="input" name="auto_backup_enabled"><option value="0" {sel(st.get('auto_backup_enabled','0'),'0')}>关闭</option><option value="1" {sel(st.get('auto_backup_enabled','0'),'1')}>开启</option></select></div><div><label>间隔（小时）</label><input class="input" name="auto_backup_hours" value="{h(st.get('auto_backup_hours','24'))}"></div><div><label>最多保留份数</label><input class="input" name="backup_keep" value="{h(st.get('backup_keep','10'))}"></div></div><p class="muted">超出份数时自动删除最旧的手动/自动备份；"恢复前"自动备份始终保留最近 3 份。备份存放在数据目录 <code>data/backups/</code>。</p><button class="btn">保存自动备份设置</button></form></div>'''
     body=(f'''<div class="section-head" style="margin-top:0"><div><h2>管理后台</h2><p class="muted" style="margin:4px 0 0">版本 {h(BUILD_TAG)} · {h(public_base_url())}</p></div></div>{_weak}{_msg_html}{_tabnav}'''
         +_pane('overview',f'''{overview}''')
         +_pane('models',f'''<div class="card">{bulk_section}</div><div class="card"><h3>模型配置管理（三方 OpenAI 兼容/Ollama 中转）</h3><p class="muted">OpenAI 兼容供应商支持填写 Base URL + API Key 后自动请求 <code>/models</code> 批量导入模型 ID；多模态能力请按上游真实能力勾选，网关会据此做路由过滤。</p>{discover_form}<table width="100%"><tr><th>ID</th><th>名称/协议</th><th>类型</th><th>Base URL/扩展</th><th>API Key</th><th>模型ID/显示名</th><th>状态</th><th>能力</th><th>排序/超时/Token</th><th>操作</th></tr>{model_html}{new_model}</table></div>''')
@@ -2672,10 +2862,24 @@ def admin():
         +_pane('users',f'''<div class="card"><h3>用户 / 套餐 / 额度</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>套餐</th><th>自定义额度 / Key数</th><th>到期</th><th>余额</th><th>模型权限</th><th>状态</th><th>今日已用</th><th>操作</th></tr>{uh}</table></div><div class="card"><h3>API Key 管理</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>Key</th><th>状态</th><th>RPM</th><th>Key日额度</th><th>IP白名单</th><th>模型权限</th><th>最后使用</th><th>操作</th></tr>{kh}</table></div>''')
         +_pane('billing',f'''<div class="card"><h3>易支付配置</h3><p>当前支付状态：{pay_status}</p><form method="post"><input type="hidden" name="act" value="save_epay"><div class="grid"><div><label>启用支付</label><select class="input" name="payment_enabled"><option value="0" {sel(st.get('payment_enabled'),'0')}>禁用/演示</option><option value="1" {sel(st.get('payment_enabled'),'1')}>启用</option></select></div><div><label>易支付网关</label><input class="input" name="epay_api_url" value="{h(st.get('epay_api_url',''))}" placeholder="https://epay.example.com"></div><div><label>商户 PID</label><input class="input" name="epay_pid" value="{h(st.get('epay_pid',''))}"></div><div><label>商户 Key</label><input class="input" name="epay_key" value="{h(st.get('epay_key',''))}"></div><div><label>域名</label><input class="input" name="domain" value="{h(st.get('domain',''))}"></div><div><label>公网 Base URL</label><input class="input" name="public_base_url" value="{h(st.get('public_base_url',''))}"></div></div><button class="btn">保存易支付配置</button></form></div><div class="card"><h3>套餐 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>价格</th><th>日额度</th><th>RPM</th><th>天数</th><th>状态</th><th>排序</th><th>说明</th><th>操作</th></tr>{plan_html}{new_plan}</table></div><div class="card"><h3>订单管理</h3><table width="100%"><tr><th>ID</th><th>订单号</th><th>用户</th><th>套餐</th><th>金额</th><th>方式</th><th>交易号</th><th>状态</th><th>支付时间</th><th>操作</th></tr>{oh}</table></div>''')
         +_pane('tickets',f'''<div class="card"><h3>工单管理</h3><table width="100%"><tr><th>ID</th><th>用户</th><th>内容/最近消息</th><th>分类</th><th>优先级</th><th>状态/回复</th></tr>{th}</table></div>''')
-        +_pane('system',f'''<div class="card"><h3>SMTP 邮件配置</h3><form method="post"><input type="hidden" name="act" value="save_smtp"><div class="grid"><div><label>启用 SMTP</label><select class="input" name="smtp_enabled"><option value="0" {sel(st.get('smtp_enabled'),'0')}>禁用</option><option value="1" {sel(st.get('smtp_enabled'),'1')}>启用</option></select></div><div><label>SMTP Host</label><input class="input" name="smtp_host" value="{h(st.get('smtp_host',''))}" placeholder="smtp.example.com"></div><div><label>端口</label><input class="input" name="smtp_port" value="{h(st.get('smtp_port','587'))}"></div><div><label>加密</label><select class="input" name="smtp_encryption"><option value="tls" {sel(st.get('smtp_encryption'),'tls')}>TLS/STARTTLS</option><option value="ssl" {sel(st.get('smtp_encryption'),'ssl')}>SSL</option><option value="none" {sel(st.get('smtp_encryption'),'none')}>不加密</option></select></div><div><label>账号</label><input class="input" name="smtp_username" value="{h(st.get('smtp_username',''))}"></div><div><label>密码/授权码</label><input class="input" name="smtp_password" value="{h(st.get('smtp_password',''))}"></div><div><label>发件邮箱</label><input class="input" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"></div><div><label>发件名称</label><input class="input" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"></div></div><button class="btn">保存 SMTP 配置</button></form><form method="post"><input type="hidden" name="act" value="test_smtp"><input type="hidden" name="smtp_enabled" value="{h(st.get('smtp_enabled','0'))}"><input type="hidden" name="smtp_host" value="{h(st.get('smtp_host',''))}"><input type="hidden" name="smtp_port" value="{h(st.get('smtp_port','587'))}"><input type="hidden" name="smtp_username" value="{h(st.get('smtp_username',''))}"><input type="hidden" name="smtp_password" value="{h(st.get('smtp_password',''))}"><input type="hidden" name="smtp_encryption" value="{h(st.get('smtp_encryption','tls'))}"><input type="hidden" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"><input type="hidden" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"><div class="grid"><div><label>测试收件邮箱</label><input class="input" name="test_email" value="{h(current_user()['email'] or '')}"></div></div><button class="btn btn2">发送测试邮件</button></form></div><div class="card"><h3>管理项目 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>Slug</th><th>说明</th><th>链接</th><th>状态</th><th>排序</th><th>操作</th></tr>{proj_html}{new_proj}</table></div><div class="card"><h3>用量排行</h3><form method="post"><input type="hidden" name="act" value="clear_usage_logs"><button class="btn btn-danger">清理全部调用日志/重置今日用量</button></form><table width="100%"><tr><th>用户</th><th>调用次数</th><th>总 Tokens</th><th>最后调用</th></tr>{usage_html}</table></div>''')
+        +_pane('system',f'''{site_section}{backup_section}<div class="card"><h3>SMTP 邮件配置</h3><form method="post"><input type="hidden" name="act" value="save_smtp"><div class="grid"><div><label>启用 SMTP</label><select class="input" name="smtp_enabled"><option value="0" {sel(st.get('smtp_enabled'),'0')}>禁用</option><option value="1" {sel(st.get('smtp_enabled'),'1')}>启用</option></select></div><div><label>SMTP Host</label><input class="input" name="smtp_host" value="{h(st.get('smtp_host',''))}" placeholder="smtp.example.com"></div><div><label>端口</label><input class="input" name="smtp_port" value="{h(st.get('smtp_port','587'))}"></div><div><label>加密</label><select class="input" name="smtp_encryption"><option value="tls" {sel(st.get('smtp_encryption'),'tls')}>TLS/STARTTLS</option><option value="ssl" {sel(st.get('smtp_encryption'),'ssl')}>SSL</option><option value="none" {sel(st.get('smtp_encryption'),'none')}>不加密</option></select></div><div><label>账号</label><input class="input" name="smtp_username" value="{h(st.get('smtp_username',''))}"></div><div><label>密码/授权码</label><input class="input" name="smtp_password" value="{h(st.get('smtp_password',''))}"></div><div><label>发件邮箱</label><input class="input" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"></div><div><label>发件名称</label><input class="input" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"></div></div><button class="btn">保存 SMTP 配置</button></form><form method="post"><input type="hidden" name="act" value="test_smtp"><input type="hidden" name="smtp_enabled" value="{h(st.get('smtp_enabled','0'))}"><input type="hidden" name="smtp_host" value="{h(st.get('smtp_host',''))}"><input type="hidden" name="smtp_port" value="{h(st.get('smtp_port','587'))}"><input type="hidden" name="smtp_username" value="{h(st.get('smtp_username',''))}"><input type="hidden" name="smtp_password" value="{h(st.get('smtp_password',''))}"><input type="hidden" name="smtp_encryption" value="{h(st.get('smtp_encryption','tls'))}"><input type="hidden" name="smtp_from_email" value="{h(st.get('smtp_from_email',''))}"><input type="hidden" name="smtp_from_name" value="{h(st.get('smtp_from_name','LLM Platform'))}"><div class="grid"><div><label>测试收件邮箱</label><input class="input" name="test_email" value="{h(current_user()['email'] or '')}"></div></div><button class="btn btn2">发送测试邮件</button></form></div><div class="card"><h3>管理项目 CRUD</h3><table width="100%"><tr><th>ID</th><th>名称</th><th>Slug</th><th>说明</th><th>链接</th><th>状态</th><th>排序</th><th>操作</th></tr>{proj_html}{new_proj}</table></div><div class="card"><h3>用量排行</h3><form method="post"><input type="hidden" name="act" value="clear_usage_logs"><button class="btn btn-danger">清理全部调用日志/重置今日用量</button></form><table width="100%"><tr><th>用户</th><th>调用次数</th><th>总 Tokens</th><th>最后调用</th></tr>{usage_html}</table></div>''')
         +_pane('docs',f'''{openai_compat_docs_html(st.get('public_base_url') or PUBLIC_BASE_URL)}''')
     )
     return page(body)
+
+@app.route('/admin/backup/download')
+@admin_required
+def admin_backup_download():
+    from flask import send_file
+    name=request.args.get('name','')
+    try:
+        if name=='now':
+            name=create_backup('manual'); prune_backups()
+        p=backup_path(name)
+        if not os.path.exists(p): return page('<div class="card"><h2>备份不存在</h2></div>'),404
+    except ValueError as e:
+        return page('<div class="card"><h2>%s</h2></div>'%h(e)),400
+    return send_file(p, as_attachment=True, download_name=name, mimetype='application/x-sqlite3')
 
 @app.route('/health')
 def health():
